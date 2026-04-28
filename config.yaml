@@ -1,0 +1,68 @@
+# config.yaml
+# -----------
+# All tunable simulation parameters in one place.
+# Import via:  cfg = Config.load('config.yaml')
+
+# -- Environment --------------------------------------------------------------
+world:
+  preset: lab           # 'lab' | 'corridor' | 'open'
+
+# -- Robot --------------------------------------------------------------------
+robot:
+  start_x:     1.0      # initial x  (metres)
+  start_y:     1.0      # initial y  (metres)
+  start_theta: 0.0      # initial heading (radians)
+  radius:      0.25     # physical radius (m) -- matches paper
+  max_v:       0.5      # max linear velocity  (m/s)
+  max_omega:   1.0      # max angular velocity (rad/s)
+
+# -- Simulation ---------------------------------------------------------------
+sim:
+  dt:          0.05     # timestep (s)  -> 20 Hz
+  render_fps:  20       # target render rate
+
+# -- Sensor (Phase 2) ---------------------------------------------------------
+sensor:
+  fov_deg:     180.0    # total field of view (degrees)
+  num_rays:    181      # number of rays (matches SICK laser in paper)
+  max_range:   8.0      # max laser range (metres)
+  noise_range: 0.03     # 1-sigma range noise  (m)
+  noise_bearing: 0.01   # 1-sigma bearing noise (rad)
+
+# -- EKF-SLAM (Phase 4) -------------------------------------------------------
+ekf:
+  # Process noise (motion model uncertainty)
+  Q_v:   0.02           # translational velocity noise variance
+  Q_w:   0.05           # rotational velocity noise variance
+
+  # Measurement noise -- must match sensor above
+  R_range:   0.03       # range    std dev  (m)
+  R_bearing: 0.01       # bearing  std dev  (rad)
+
+  # Data association gating threshold (Mahalanobis distance)
+  gate_chi2: 9.21       # 99th percentile of chi2(2)
+
+  # New-feature init covariance scale
+  init_cov_corner: 0.5
+  init_cov_line:   0.5
+
+# -- Monte Carlo (Phase 5) ----------------------------------------------------
+montecarlo:
+  n_samples_local:  300   # MC points for local  uncertainty search
+  n_samples_global: 800   # MC points for global uncertainty search
+  local_area_size:  5.0   # side length of local search square (m)
+  uncertainty_lo:   0.40  # lower probability threshold for 'uncertain'
+  uncertainty_hi:   0.60  # upper probability threshold for 'uncertain'
+  virtual_cov:      0.32  # diagonal covariance for virtual boundary lines
+
+# -- Navigation (Phase 6) -----------------------------------------------------
+navigation:
+  goal_tolerance:   0.30  # distance at which goal is considered reached (m)
+  controller_k_v:   0.4   # linear  velocity proportional gain
+  controller_k_w:   1.2   # angular velocity proportional gain
+  duplicate_thresh: 0.50  # distance below which two MC pts are duplicates (m)
+
+# -- Renderer -----------------------------------------------------------------
+renderer:
+  figsize: [10, 7]
+  dpi:     110
