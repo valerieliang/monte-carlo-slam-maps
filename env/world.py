@@ -202,22 +202,31 @@ class World:
         """Long corridor (20 m × 3 m) with one perpendicular branch."""
         segs = [
             # main corridor
-            Segment([0, 0],   [20, 0]),
-            Segment([20, 0],  [20, 3]),
-            Segment([20, 3],  [0, 3]),
-            Segment([0, 3],   [0, 0]),
-            # branch corridor
-            Segment([8, 3],   [8, 9]),
-            Segment([8, 9],   [12, 9]),
-            Segment([12, 9],  [12, 3]),
+            Segment([0, 0],   [20, 0]),    # south wall - solid, no opening            
+            Segment([20, 0],  [20, 3]),    # east wall
+            Segment([20, 3],  [12, 3]),    # right part of north wall
+            Segment([8, 3],   [0, 3]),     # left part of north wall (gap from 8-12)
+            Segment([0, 3],   [0, 0]),     # west wall
+            
+            # branch corridor (goes UP from the gap)
+            Segment([8, 3],   [8, 9]),     # branch left wall
+            Segment([8, 9],   [12, 9]),    # branch top wall
+            Segment([12, 9],  [12, 3]),    # branch right wall
         ]
         cors = [
+            # outer room corners
             Corner([0,  0],  'convex'),
             Corner([20, 0],  'convex'),
             Corner([20, 3],  'convex'),
             Corner([0,  3],  'convex'),
-            Corner([8,  3],  'concave'),
-            Corner([12, 3],  'concave'),
+            
+            # opening corners on north wall
+            Corner([12, 3],  'convex'),    # right side of opening
+            Corner([8,  3],  'convex'),    # left side of opening
+            
+            # branch corners
+            Corner([8,  3],  'concave'),   # where branch meets main corridor (left)
+            Corner([12, 3],  'concave'),   # where branch meets main corridor (right)
             Corner([8,  9],  'convex'),
             Corner([12, 9],  'convex'),
         ]
