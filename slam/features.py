@@ -1,6 +1,6 @@
 """
 slam/features.py
-
+----------------
 Feature measurement models, analytic Jacobians, and the synthetic
 observation generator used throughout Phases 3 and 4.
 
@@ -25,7 +25,7 @@ Jacobian convention
 -------------------
 H  = dz/dx_full   where x_full = [x_v, y_v, theta_v, ..., feat_params, ...]
      shape (2, 3 + 2)  for both feature types when computing w.r.t.
-     [vehicle pose | this feature's 2 params] -- the EKF update.py will
+     [vehicle pose | this feature's 2 params] — the EKF update.py will
      scatter these into the full-state Jacobian.
 
 All angles wrapped to (-pi, pi].
@@ -37,9 +37,9 @@ from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Observation containers
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class CornerObs:
@@ -52,7 +52,7 @@ class CornerObs:
     R       : (2,2) measurement noise covariance
     kind    : 'convex' | 'concave'
     gt_pos  : (2,) ground-truth world position  (available in sim; not used
-              by EKF -- here for test assertions only)
+              by EKF — here for test assertions only)
     """
     z:      np.ndarray      # (2,)  [r, beta]
     R:      np.ndarray      # (2,2)
@@ -78,9 +78,9 @@ class LineObs:
     gt_alpha: Optional[float] = None
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Jacobian container
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Jacobians:
@@ -98,9 +98,9 @@ class Jacobians:
     H_f: np.ndarray   # (2, 2)
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Pure measurement-model functions
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def h_corner(robot_pose: np.ndarray,
              corner_pos: np.ndarray) -> np.ndarray:
@@ -146,9 +146,9 @@ def h_line(robot_pose: np.ndarray,
     return np.array([rho_obs, alpha_obs])
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Analytic Jacobians
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def feature_jacobians(robot_pose:  np.ndarray,
                       feature_type: str,
@@ -259,9 +259,9 @@ def _jacobian_line(robot_pose: np.ndarray,
     return Jacobians(H_v=H_v, H_f=H_f)
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Numerical Jacobian (for testing only)
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def numerical_jacobian_corner(robot_pose:  np.ndarray,
                                corner_pos: np.ndarray,
@@ -319,9 +319,9 @@ def numerical_jacobian_line(robot_pose:   np.ndarray,
     return H_v, H_f
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Synthetic observation generator  (the "cheat" extractor)
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class FeatureExtractor:
     """
@@ -340,7 +340,7 @@ class FeatureExtractor:
     -------------------
     A feature is observable if:
       1. It is within sensor max_range of the robot.
-      2. It is within the sensor FOV (bearing within +/- fov/2).
+      2. It is within the sensor FOV (bearing within ±fov/2).
       3. The line-of-sight from robot to feature is not occluded by any wall.
          (Tested via World.ray_intersect toward the feature.)
 
@@ -359,7 +359,7 @@ class FeatureExtractor:
                  noise_range:   float,
                  noise_bearing: float,
                  rng: np.random.Generator | None = None):
-        self.fov_half      = fov_rad / 2.0        # +/- fov_half from heading
+        self.fov_half      = fov_rad / 2.0        # ±fov_half from heading
         self.max_range     = float(max_range)
         self.noise_range   = float(noise_range)
         self.noise_bearing = float(noise_bearing)
@@ -375,11 +375,12 @@ class FeatureExtractor:
             rng           = rng,
         )
 
-    # -- public API ------------------------------------------------------------
+    # ── public API ────────────────────────────────────────────────────────────
 
     def extract(self,
                 robot_pose: np.ndarray,
-                world
+                world,
+                scan=None,
                 ) -> Tuple[List[CornerObs], List[LineObs]]:
         """
         Generate all visible corner and line observations from the robot's
@@ -387,8 +388,10 @@ class FeatureExtractor:
 
         Parameters
         ----------
-        robot_pose : (3,) [xv, yv, theta_v]   -- true pose (EKF uses estimated)
+        robot_pose : (3,) [xv, yv, theta_v]   — true pose (EKF uses estimated)
         world      : env.World
+        scan       : ScanResult | None  — if provided, used for laser-support
+                     validation of line features (rejects phantom walls)
 
         Returns
         -------
@@ -396,10 +399,10 @@ class FeatureExtractor:
         lines   : list of LineObs
         """
         corners = self._extract_corners(robot_pose, world)
-        lines   = self._extract_lines(robot_pose, world)
+        lines   = self._extract_lines(robot_pose, world, scan)
         return corners, lines
 
-    # -- corners ---------------------------------------------------------------
+    # ── corners ───────────────────────────────────────────────────────────────
 
     def _extract_corners(self,
                          robot_pose: np.ndarray,
@@ -423,7 +426,7 @@ class FeatureExtractor:
             if abs(bearing) > self.fov_half:
                 continue
 
-            # occlusion check -- cast ray toward corner;
+            # occlusion check — cast ray toward corner;
             # hit must be at least as far as the corner itself
             angle  = np.arctan2(dy, dx)
             result = world.ray_intersect(origin, angle, self.max_range)
@@ -448,15 +451,25 @@ class FeatureExtractor:
 
         return obs
 
-    # -- lines ----------------------------------------------------------------
+    # ── lines ────────────────────────────────────────────────────────────────
+
+    # minimum fraction of a segment's length that must be covered by laser
+    # returns before accepting the segment as a valid line observation.
+    SUPPORT_FRACTION = 0.25
+    # minimum absolute number of supporting laser hits
+    SUPPORT_MIN_HITS = 2
 
     def _extract_lines(self,
                        robot_pose: np.ndarray,
-                       world) -> List[LineObs]:
+                       world,
+                       scan=None) -> List[LineObs]:
         xv, yv, tv = robot_pose
         origin     = np.array([xv, yv])
         R          = self._R_line()
         obs        = []
+
+        # Pre-compute valid hit points from scan for support check
+        hit_pts = scan.valid_hits if scan is not None else None  # (M,2) or None
 
         for seg in world.segments:
             # closest point on segment to robot
@@ -472,16 +485,42 @@ class FeatureExtractor:
             if abs(bearing) > self.fov_half:
                 continue
 
-            # occlusion: cast ray to midpoint of segment
-            mid   = seg.midpoint
-            angle = np.arctan2(mid[1] - yv, mid[0] - xv)
-            mid_d = np.linalg.norm(mid - origin)
-            result = world.ray_intersect(origin, angle, self.max_range)
-            if result is None:
+            # ── facing-side check ────────────────────────────────────────────
+            # The robot must be on the same side as the wall's outward normal.
+            # If it's on the opposite side the wall is facing away — physically
+            # impossible to observe with a laser scanner.
+            seg_normal = seg.normal
+            robot_side = np.dot(origin - seg.p0, seg_normal)
+            if robot_side <= 0:
                 continue
-            hit_dist, _ = result
-            if hit_dist < mid_d - 0.20:
-                continue
+
+            # ── laser support check ───────────────────────────────────────────
+            # Project scan hit points onto the segment and count those that:
+            #   (a) fall within the segment region (between endpoint normals)
+            #   (b) are within tol_perp of the segment's infinite line
+            #   (c) are NOT within an endpoint exclusion zone — hits that
+            #       land within endpoint_tol of p0 or p1 are junction grazes
+            #       from an adjacent wall and must not count as support.
+            if hit_pts is not None and len(hit_pts) > 0:
+                seg_dir      = seg.direction
+                rel          = hit_pts - seg.p0           # (M, 2)
+                t_proj       = rel @ seg_dir              # (M,) along-seg coord
+                d_perp       = np.abs(rel @ seg_normal)   # (M,) dist to line
+                tol_perp     = max(0.10, 3 * self.noise_range)
+                endpoint_tol = max(0.15, 4 * self.noise_range)
+                # distance to each endpoint
+                d_p0 = np.linalg.norm(hit_pts - seg.p0, axis=1)
+                d_p1 = np.linalg.norm(hit_pts - seg.p1, axis=1)
+                on_seg = (
+                    (t_proj  >  endpoint_tol) &          # not a p0 graze
+                    (t_proj  <  seg.length - endpoint_tol) &  # not a p1 graze
+                    (d_perp  <= tol_perp) &
+                    (d_p0    >  endpoint_tol) &
+                    (d_p1    >  endpoint_tol)
+                )
+                n_support = int(on_seg.sum())
+                if n_support < self.SUPPORT_MIN_HITS:
+                    continue
 
             # polar representation of the segment's infinite line
             rho, alpha = seg.as_polar_line()
@@ -502,7 +541,7 @@ class FeatureExtractor:
 
         return obs
 
-    # -- noise covariances -----------------------------------------------------
+    # ── noise covariances ─────────────────────────────────────────────────────
 
     def _R_corner(self) -> np.ndarray:
         return np.diag([self.noise_range**2, self.noise_bearing**2])
@@ -511,9 +550,9 @@ class FeatureExtractor:
         return np.diag([self.noise_range**2, self.noise_bearing**2])
 
 
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# -----------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _wrap(angle) -> float:
     """Wrap angle(s) to (-pi, pi]."""

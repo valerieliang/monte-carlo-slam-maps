@@ -109,7 +109,7 @@ def run(cfg: Config, preset: str | None = None) -> None:
     last_frame = time.perf_counter()
 
     last_scan    = sensor.scan(robot, world)
-    last_corners, last_lines = extractor.extract(robot.pose, world)
+    last_corners, last_lines = extractor.extract(robot.pose, world, last_scan)
 
     print("[main] Phase 3 running.  F toggles feature overlay.  Q to quit.")
 
@@ -146,7 +146,7 @@ def run(cfg: Config, preset: str | None = None) -> None:
         v, omega = keys.compute_command(cfg.robot.max_v, cfg.robot.max_omega)
         robot.step(v, omega, dt)
         last_scan             = sensor.scan(robot, world)
-        last_corners, last_lines = extractor.extract(robot.pose, world)
+        last_corners, last_lines = extractor.extract(robot.pose, world, last_scan)
 
         # render at target FPS
         now = time.perf_counter()

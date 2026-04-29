@@ -25,7 +25,7 @@ sim:
 sensor:
   fov_deg:     180.0    # total field of view (degrees)
   num_rays:    181      # number of rays (matches SICK laser in paper)
-  max_range:   8.0      # max laser range (metres)
+  max_range:   20.0     # max laser range (metres)
   noise_range: 0.03     # 1-sigma range noise  (m)
   noise_bearing: 0.01   # 1-sigma bearing noise (rad)
 
