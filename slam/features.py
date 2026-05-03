@@ -67,15 +67,20 @@ class LineObs:
 
     Attributes
     ----------
-    z        : (2,)  [rho_obs, alpha_obs]  in robot frame
-    R        : (2,2) measurement noise covariance
-    gt_rho   : ground-truth rho   (sim only)
-    gt_alpha : ground-truth alpha (sim only)
+    z               : (2,)  [rho_obs, alpha_obs]  in robot frame
+    R               : (2,2) measurement noise covariance
+    gt_rho          : ground-truth rho   (sim only)
+    gt_alpha        : ground-truth alpha (sim only)
+    cluster_midpoint: (2,) world-frame centre of the observed wall cluster.
+                      Used by the renderer to place the '+' marker at the
+                      correct location when multiple sections of the same
+                      infinite line are observed.  None = use foot-of-perp.
     """
-    z:        np.ndarray    # (2,)  [rho_obs, alpha_obs]
-    R:        np.ndarray    # (2,2)
-    gt_rho:   Optional[float] = None
-    gt_alpha: Optional[float] = None
+    z:                np.ndarray    # (2,)  [rho_obs, alpha_obs]
+    R:                np.ndarray    # (2,2)
+    gt_rho:           Optional[float]          = None
+    gt_alpha:         Optional[float]          = None
+    cluster_midpoint: Optional[np.ndarray]     = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -400,6 +405,10 @@ class FeatureExtractor:
         """
         corners = self._extract_corners(robot_pose, world)
         lines   = self._extract_lines(robot_pose, world, scan)
+        # No deduplication needed: _extract_lines groups collinear segments,
+        # so each unique (rho,alpha) line is processed exactly once.
+        # Multiple observations per line (different rho_obs) represent
+        # distinct wall sections separated by a physical gap.
         return corners, lines
 
     # ── corners ───────────────────────────────────────────────────────────────
@@ -458,88 +467,199 @@ class FeatureExtractor:
     SUPPORT_FRACTION = 0.25
     # minimum absolute number of supporting laser hits
     SUPPORT_MIN_HITS = 2
+    # gap detection: a spacing between adjacent along-segment hits is a real
+    # gap if it exceeds GAP_MULTIPLIER * expected_angular_spacing at that range.
+    # Higher = fewer splits (more tolerant of angular thinning).
+    GAP_MULTIPLIER   = 3.0
+    # minimum cluster size to emit a sub-segment observation after splitting
+    GAP_MIN_CLUSTER  = 2
 
     def _extract_lines(self,
                        robot_pose: np.ndarray,
                        world,
                        scan=None) -> List[LineObs]:
+        """
+        Extract line observations, grouping collinear segments so that gaps
+        between adjacent collinear wall sections produce separate observations.
+        """
         xv, yv, tv = robot_pose
-        origin     = np.array([xv, yv])
-        R          = self._R_line()
-        obs        = []
+        origin      = np.array([xv, yv])
+        R           = self._R_line()
+        obs         = []
+        hit_pts     = scan.valid_hits if scan is not None else None
 
-        # Pre-compute valid hit points from scan for support check
-        hit_pts = scan.valid_hits if scan is not None else None  # (M,2) or None
-
+        # Group segments by shared polar line identity
+        groups: dict = {}
         for seg in world.segments:
-            # closest point on segment to robot
-            closest, dist = _closest_point_on_segment(origin, seg.p0, seg.p1)
+            rho, alpha = seg.as_polar_line()
+            key = (round(rho, 2), round(np.degrees(alpha), 1))
+            groups.setdefault(key, []).append(seg)
 
-            # range gate on closest point
-            if dist > self.max_range:
-                continue
+        for (rho_q, alpha_q_deg), seg_list in groups.items():
+            ref_seg    = seg_list[0]
+            rho, alpha = ref_seg.as_polar_line()
+            seg_normal = ref_seg.normal
+            seg_dir    = ref_seg.direction
 
-            # bearing of closest point
-            dx, dy  = closest - origin
-            bearing = _wrap(np.arctan2(dy, dx) - tv)
-            if abs(bearing) > self.fov_half:
-                continue
-
-            # ── facing-side check ────────────────────────────────────────────
-            # The robot must be on the same side as the wall's outward normal.
-            # If it's on the opposite side the wall is facing away — physically
-            # impossible to observe with a laser scanner.
-            seg_normal = seg.normal
-            robot_side = np.dot(origin - seg.p0, seg_normal)
+            # facing-side check
+            robot_side = np.dot(origin - ref_seg.p0, seg_normal)
             if robot_side <= 0:
                 continue
 
-            # ── laser support check ───────────────────────────────────────────
-            # Project scan hit points onto the segment and count those that:
-            #   (a) fall within the segment region (between endpoint normals)
-            #   (b) are within tol_perp of the segment's infinite line
-            #   (c) are NOT within an endpoint exclusion zone — hits that
-            #       land within endpoint_tol of p0 or p1 are junction grazes
-            #       from an adjacent wall and must not count as support.
+            # noiseless measurement
+            z_clean = h_line(robot_pose, rho, alpha)
+            if z_clean[0] < 0:
+                continue
+
+            # range gate: any segment must be within max_range
+            any_close = any(
+                _closest_point_on_segment(origin, seg.p0, seg.p1)[1] <= self.max_range
+                for seg in seg_list)
+            if not any_close:
+                continue
+
+            # bearing gate: any closest point must be within FOV
+            in_fov = False
+            for seg in seg_list:
+                closest, _ = _closest_point_on_segment(origin, seg.p0, seg.p1)
+                bearing = _wrap(np.arctan2(closest[1]-yv, closest[0]-xv) - tv)
+                if abs(bearing) <= self.fov_half:
+                    in_fov = True
+                    break
+            if not in_fov:
+                continue
+
             if hit_pts is not None and len(hit_pts) > 0:
-                seg_dir      = seg.direction
-                rel          = hit_pts - seg.p0           # (M, 2)
-                t_proj       = rel @ seg_dir              # (M,) along-seg coord
-                d_perp       = np.abs(rel @ seg_normal)   # (M,) dist to line
                 tol_perp     = max(0.10, 3 * self.noise_range)
                 endpoint_tol = max(0.15, 4 * self.noise_range)
-                # distance to each endpoint
-                d_p0 = np.linalg.norm(hit_pts - seg.p0, axis=1)
-                d_p1 = np.linalg.norm(hit_pts - seg.p1, axis=1)
-                on_seg = (
-                    (t_proj  >  endpoint_tol) &          # not a p0 graze
-                    (t_proj  <  seg.length - endpoint_tol) &  # not a p1 graze
-                    (d_perp  <= tol_perp) &
-                    (d_p0    >  endpoint_tol) &
-                    (d_p1    >  endpoint_tol)
-                )
-                n_support = int(on_seg.sum())
-                if n_support < self.SUPPORT_MIN_HITS:
+
+                # collect hits from ALL segments in group
+                group_on = np.zeros(len(hit_pts), dtype=bool)
+                for seg in seg_list:
+                    rel    = hit_pts - seg.p0
+                    t_proj = rel @ seg.direction
+                    d_perp = np.abs(rel @ seg.normal)
+                    d_p0   = np.linalg.norm(hit_pts - seg.p0, axis=1)
+                    d_p1   = np.linalg.norm(hit_pts - seg.p1, axis=1)
+                    group_on |= (
+                        (t_proj  >  endpoint_tol) &
+                        (t_proj  <  seg.length - endpoint_tol) &
+                        (d_perp  <= tol_perp) &
+                        (d_p0    >  endpoint_tol) &
+                        (d_p1    >  endpoint_tol)
+                    )
+
+                if int(group_on.sum()) < self.SUPPORT_MIN_HITS:
                     continue
 
-            # polar representation of the segment's infinite line
-            rho, alpha = seg.as_polar_line()
+                # gap split on merged hit cloud
+                support_hits = hit_pts[group_on]
+                common_p0    = ref_seg.p0
+                t_along      = (support_hits - common_p0) @ seg_dir
+                sort_idx     = np.argsort(t_along)
+                t_sorted     = t_along[sort_idx]
+                pts_sorted   = support_hits[sort_idx]
 
-            # noiseless observation
-            z_clean = h_line(robot_pose, rho, alpha)
+                clusters = self._split_into_clusters(
+                    t_sorted, pts_sorted,
+                    seg_p0=common_p0, seg_dir=seg_dir, robot_pos=origin)
 
-            # add noise
-            rho_n   = z_clean[0] + self._rng.normal(0, self.noise_range)
-            alpha_n  = _wrap(z_clean[1] + self._rng.normal(0, self.noise_bearing))
-
-            obs.append(LineObs(
-                z        = np.array([rho_n, alpha_n]),
-                R        = R.copy(),
-                gt_rho   = rho,
-                gt_alpha = alpha,
-            ))
+                for cluster_pts in clusters:
+                    if len(cluster_pts) < self.GAP_MIN_CLUSTER:
+                        continue
+                    full_mean    = support_hits.mean(axis=0)
+                    cluster_mean = cluster_pts.mean(axis=0)
+                    delta_rho    = float(np.dot(cluster_mean - full_mean, seg_normal))
+                    rho_obs_c    = z_clean[0] + delta_rho
+                    if rho_obs_c < 0:
+                        continue
+                    rho_n   = rho_obs_c + self._rng.normal(0, self.noise_range)
+                    alpha_n = _wrap(z_clean[1] + self._rng.normal(0, self.noise_bearing))
+                    obs.append(LineObs(
+                        z=np.array([rho_n, alpha_n]), R=R.copy(),
+                        gt_rho=rho, gt_alpha=alpha,
+                        cluster_midpoint=cluster_mean.copy()))
+            else:
+                rho_n   = z_clean[0] + self._rng.normal(0, self.noise_range)
+                alpha_n = _wrap(z_clean[1] + self._rng.normal(0, self.noise_bearing))
+                obs.append(LineObs(
+                    z=np.array([rho_n, alpha_n]), R=R.copy(),
+                    gt_rho=rho, gt_alpha=alpha))
 
         return obs
+
+
+    # ── gap splitting ─────────────────────────────────────────────────────────
+
+    def _split_into_clusters(self,
+                             t_sorted:   np.ndarray,
+                             pts_sorted: np.ndarray,
+                             seg_p0:     np.ndarray,
+                             seg_dir:    np.ndarray,
+                             robot_pos:  np.ndarray
+                             ) -> List[np.ndarray]:
+        """
+        Split along-segment hit points into contiguous clusters by detecting
+        gaps that exceed the expected angular ray spacing at that range.
+
+        A gap between adjacent hits is "real" (open space, not angular thinning)
+        when it is wider than GAP_MULTIPLIER × expected_angular_spacing, where
+        expected_angular_spacing = range * d_theta / cos(incidence_angle).
+
+        Returns a list of (K_i, 2) arrays, one per cluster.
+        """
+        d_theta = np.radians(180.0 / 180.0)   # 1-deg ray spacing (181 rays, 180-deg FOV)
+        seg_normal = np.array([-seg_dir[1], seg_dir[0]])
+
+        if len(t_sorted) == 0:
+            return []
+        if len(t_sorted) == 1:
+            return [pts_sorted]
+
+        cluster_starts = [0]
+        for i in range(len(t_sorted) - 1):
+            gap = t_sorted[i+1] - t_sorted[i]
+            # midpoint of candidate gap in world frame
+            t_mid      = 0.5 * (t_sorted[i] + t_sorted[i+1])
+            mid_world  = seg_p0 + t_mid * seg_dir
+            range_mid  = np.linalg.norm(mid_world - robot_pos)
+            to_mid     = mid_world - robot_pos
+            cos_inc    = abs(np.dot(to_mid / (range_mid + 1e-9), seg_normal))
+            expected   = range_mid * d_theta / max(cos_inc, 0.05)
+            threshold  = self.GAP_MULTIPLIER * expected
+            if gap > threshold:
+                cluster_starts.append(i + 1)
+
+        clusters = []
+        for k, start in enumerate(cluster_starts):
+            end = cluster_starts[k+1] if k+1 < len(cluster_starts) else len(pts_sorted)
+            clusters.append(pts_sorted[start:end])
+        return clusters
+
+    # ── deduplication ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _deduplicate_lines(lines: List[LineObs],
+                           rho_tol:   float = 0.15,
+                           alpha_tol: float = 0.05) -> List[LineObs]:
+        """
+        Deduplicate line observations with identical (rho, alpha) that arise
+        from collinear segments being processed twice.  Observations from
+        gap-split clusters on the same infinite line have the same gt_alpha
+        but deliberately different rho_obs (z[0]) and are NOT deduplicated.
+        """
+        kept = []
+        for obs in lines:
+            duplicate = False
+            for existing in kept:
+                drho   = abs(obs.z[0]     - existing.z[0])
+                dalpha = abs(_wrap(obs.z[1] - existing.z[1]))
+                if drho < rho_tol and dalpha < alpha_tol:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append(obs)
+        return kept
 
     # ── noise covariances ─────────────────────────────────────────────────────
 

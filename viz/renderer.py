@@ -298,21 +298,21 @@ class Renderer:
             self._feat_corner_pts.set_data([], [])
 
         # ── lines ─────────────────────────────────────────────────────────────
+        # Prefer cluster_midpoint when available — it marks the centre of the
+        # actual observed wall section, which is meaningful when multiple
+        # collinear sections exist (gap detection).  Fall back to the
+        # foot-of-perpendicular from the robot when cluster_midpoint is None.
         if line_obs:
             lxs, lys = [], []
             for obs in line_obs:
-                rho_obs, alpha_obs = obs.z
-                # convert robot-frame alpha_obs back to world-frame line normal
-                alpha_world = _wrap(alpha_obs + rt)
-                # foot of perpendicular from world origin to the observed line,
-                # shifted by rho_obs along the normal
-                foot_x = rho_obs * np.cos(alpha_world)
-                foot_y = rho_obs * np.sin(alpha_world)
-                # convert from line-origin-relative to world (add robot offset)
-                world_x = rx + foot_x
-                world_y = ry + foot_y
-                lxs.append(world_x)
-                lys.append(world_y)
+                if obs.cluster_midpoint is not None:
+                    lxs.append(obs.cluster_midpoint[0])
+                    lys.append(obs.cluster_midpoint[1])
+                else:
+                    rho_obs, alpha_obs = obs.z
+                    alpha_world = _wrap(alpha_obs + rt)
+                    lxs.append(rx + rho_obs * np.cos(alpha_world))
+                    lys.append(ry + rho_obs * np.sin(alpha_world))
             self._feat_line_pts.set_data(lxs, lys)
         else:
             self._feat_line_pts.set_data([], [])
