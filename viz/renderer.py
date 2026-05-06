@@ -3,11 +3,16 @@ viz/renderer.py
 ---------------
 Bird's-eye 2-D renderer using matplotlib.
 
-Phase 1: walls, corners, robot pose + trail
-Phase 2: laser beam fan + hit-point cloud
-Phase 3: extracted feature overlays  (ACTIVE)
-Phase 4: SLAM map overlay + covariance ellipses (stub)
+Phase 1: static world + manual keyboard drive.
+Phase 2: live laser scan overlay.
+Phase 3: extracted feature overlays.
+Phase 4: SLAM map overlay + covariance ellipses  (ACTIVE)
 Phase 5: MC uncertainty heatmap (stub)
+
+Controls (set up in main.py)
+-----------------------------
+  F  : toggle extracted-feature overlay (observed corners / wall midpoints)
+  M  : toggle SLAM map overlay (estimated corners / walls + uncertainty)
 """
 
 from __future__ import annotations
@@ -35,13 +40,13 @@ PAL = dict(
     laser        = '#fde68a',
     laser_alpha  = 0.75,
     beam_alpha   = 0.10,
-    # Phase 3 — extracted features
+    # Phase 3 — extracted features (raw per-frame observations)
     feat_corner  = '#4ade80',   # green  — observed corner hit
-    feat_line    = '#f472b6',   # pink   — observed line midpoint tick
+    feat_line    = '#f472b6',   # pink   — observed wall midpoint tick
     feat_alpha   = 0.85,
-    # Phase 4 stubs
-    slam_wall    = '#34d399',
-    slam_corner  = '#f87171',
+    # Phase 4 — SLAM map
+    slam_corner  = '#f87171',   # red    — EKF corner estimate
+    slam_line    = '#34d399',   # teal   — EKF wall estimate
     # Phase 5 stub
     mc_low       = '#1e3a5f',
     mc_high      = '#f59e0b',
@@ -76,8 +81,8 @@ class Renderer:
         self._trail_line        = None
         self._laser_pts         = None
         self._beam_fan          = None
-        self._feat_corner_pts   = None   # Phase 3
-        self._feat_line_pts     = None   # Phase 3
+        self._feat_corner_pts   = None
+        self._feat_line_pts     = None
 
     # ------------------------------------------------------------------ init
 
@@ -116,8 +121,6 @@ class Renderer:
 
         self._update_features(robot, corner_obs or [], line_obs or [])
 
-        if slam_segments is not None:
-            self._draw_slam_map(slam_segments, slam_corners or [])
         if mc_points is not None:
             self._draw_mc(mc_points)
 
@@ -146,6 +149,7 @@ class Renderer:
         ax.set_yticks(range(int(ymin) - 1, int(ymax) + 2))
 
     def _draw_static(self) -> None:
+        # Ground-truth walls
         for seg in self.world.segments:
             self.ax.plot([seg.p0[0], seg.p1[0]],
                          [seg.p0[1], seg.p1[1]],
@@ -153,6 +157,7 @@ class Renderer:
                          alpha=PAL['wall_alpha'], solid_capstyle='round',
                          zorder=3)
 
+        # Ground-truth corners
         for c in self.world.corners:
             col = PAL['corner_cvx'] if c.kind == 'convex' else PAL['corner_ccv']
             self.ax.plot(c.pos[0], c.pos[1],
@@ -161,34 +166,81 @@ class Renderer:
                          markeredgewidth=1.6, alpha=PAL['corner_alpha'],
                          zorder=4)
 
-        leg = [
+        # ── Legend ───────────────────────────────────────────────────────────
+        # Ground truth
+        gt_entries = [
             mlines.Line2D([], [], color=PAL['wall'], linewidth=2,
-                          label='wall (GT)'),
+                          label='wall — ground truth'),
             mlines.Line2D([], [], color=PAL['corner_cvx'], marker='s',
                           linestyle='none', markerfacecolor='none',
                           markeredgewidth=1.5, markersize=6,
-                          label='convex corner (GT)'),
+                          label='convex corner — GT'),
             mlines.Line2D([], [], color=PAL['corner_ccv'], marker='s',
                           linestyle='none', markerfacecolor='none',
                           markeredgewidth=1.5, markersize=6,
-                          label='concave corner (GT)'),
+                          label='concave corner — GT'),
+        ]
+
+        # Robot & sensor
+        sensor_entries = [
             mlines.Line2D([], [], color=PAL['robot_body'], marker='o',
-                          linestyle='none', markersize=6, label='robot'),
+                          linestyle='none', markersize=6,
+                          label='robot pose'),
             mlines.Line2D([], [], color=PAL['trail'],
-                          linewidth=1.2, alpha=0.6, label='trail'),
+                          linewidth=1.2, alpha=0.6,
+                          label='robot trail'),
             mlines.Line2D([], [], color=PAL['laser'], marker='.',
                           linestyle='none', markersize=5,
                           label='laser returns'),
+        ]
+
+        # Raw per-frame feature observations  (F to toggle)
+        feat_entries = [
             mlines.Line2D([], [], color=PAL['feat_corner'], marker='o',
                           linestyle='none', markersize=7,
-                          label='observed corner'),
+                          markerfacecolor='none', markeredgewidth=2.0,
+                          label='observed corner — this frame'),
             mlines.Line2D([], [], color=PAL['feat_line'], marker='P',
                           linestyle='none', markersize=7,
-                          label='observed line'),
+                          label='observed wall midpoint — this frame'),
         ]
-        self.ax.legend(handles=leg, loc='upper right', fontsize=7,
-                       framealpha=0.25, facecolor='#1e2130',
-                       edgecolor='#334155', labelcolor='#94a3b8')
+
+        # SLAM map overlay  (M to toggle)
+        slam_entries = [
+            mlines.Line2D([], [], color=PAL['slam_corner'], marker='x',
+                          linestyle='none', markersize=9,
+                          markeredgewidth=2.5,
+                          label='SLAM corner estimate  ✕'),
+            mlines.Line2D([], [], color=PAL['slam_corner'],
+                          marker='o', markersize=8, linestyle='none',
+                          markerfacecolor='none', markeredgewidth=1.0,
+                          alpha=0.5,
+                          label='  └ 2σ position uncertainty'),
+            mlines.Line2D([], [], color=PAL['slam_line'],
+                          linestyle='--', linewidth=1.8, alpha=0.8,
+                          label='SLAM wall estimate  (dashed)'),
+            mlines.Line2D([], [], color=PAL['slam_line'], marker='D',
+                          linestyle='none', markersize=6,
+                          label='  └ wall midpoint  ◆'),
+            mlines.Line2D([], [], color=PAL['slam_line'],
+                          marker='o', markersize=8, linestyle='none',
+                          markerfacecolor='none', markeredgewidth=1.0,
+                          alpha=0.4,
+                          label='  └ 2σ wall uncertainty'),
+        ]
+
+        leg = gt_entries + sensor_entries + feat_entries + slam_entries
+        self.ax.legend(
+            handles        = leg,
+            loc            = 'upper right',
+            fontsize       = 7,
+            framealpha     = 0.30,
+            facecolor      = '#1e2130',
+            edgecolor      = '#334155',
+            labelcolor     = '#94a3b8',
+            title          = 'Legend    F = features    M = SLAM map',
+            title_fontsize = 7,
+        )
 
     # -------------------------------------------------------- dynamic artists
 
@@ -276,12 +328,10 @@ class Renderer:
 
     def _update_features(self, robot, corner_obs, line_obs) -> None:
         """
-        Back-project extracted feature observations into world frame for display.
+        Back-project extracted feature observations into world frame.
 
         Corner: world_pos = robot_pos + r * [cos(theta+beta), sin(theta+beta)]
-        Line:   closest point on observed line to robot (the foot of perpendicular)
-                = rho_obs * [cos(alpha_obs + theta), sin(alpha_obs + theta)]
-                  offset from robot
+        Line:   closest point on observed line to robot (foot of perpendicular)
         """
         rx, ry, rt = robot.x, robot.y, robot.theta
 
@@ -298,10 +348,8 @@ class Renderer:
             self._feat_corner_pts.set_data([], [])
 
         # ── lines ─────────────────────────────────────────────────────────────
-        # Prefer cluster_midpoint when available — it marks the centre of the
-        # actual observed wall section, which is meaningful when multiple
-        # collinear sections exist (gap detection).  Fall back to the
-        # foot-of-perpendicular from the robot when cluster_midpoint is None.
+        # Use cluster_midpoint when available (marks centre of observed wall
+        # section).  Fall back to foot-of-perpendicular from the robot.
         if line_obs:
             lxs, lys = [], []
             for obs in line_obs:
@@ -317,10 +365,7 @@ class Renderer:
         else:
             self._feat_line_pts.set_data([], [])
 
-    # --------------------------------------------------- Phase 4/5 stubs
-
-    def _draw_slam_map(self, segments, corners) -> None:
-        pass
+    # --------------------------------------------------- Phase 5 stub
 
     def _draw_mc(self, mc_points) -> None:
         pass

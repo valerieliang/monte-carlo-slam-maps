@@ -33,7 +33,7 @@ All angles wrapped to (-pi, pi].
 
 from __future__ import annotations
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
 
@@ -48,16 +48,31 @@ class CornerObs:
 
     Attributes
     ----------
-    z       : (2,)  [range, bearing]  in robot frame
-    R       : (2,2) measurement noise covariance
-    kind    : 'convex' | 'concave'
-    gt_pos  : (2,) ground-truth world position  (available in sim; not used
-              by EKF — here for test assertions only)
+    z            : (2,)  [range, bearing]  in robot frame
+    R            : (2,2) measurement noise covariance
+    kind         : 'convex' | 'concave' — geometry type of the detected corner.
+                   This is what Phase 3 tests assert on c.kind.
+    gt_pos       : (2,) ground-truth world position (sim only, not used by EKF)
+    feature_kind : property, always returns 'corner' — used by data_assoc /
+                   main.py for EKF dispatch (obs.feature_kind == 'corner').
     """
-    z:      np.ndarray      # (2,)  [r, beta]
-    R:      np.ndarray      # (2,2)
-    kind:   str             = 'convex'
+    z:      np.ndarray           # (2,)  [r, beta]
+    R:      np.ndarray           # (2,2)
+    kind:   str = 'convex'       # geometry: 'convex' | 'concave'
     gt_pos: Optional[np.ndarray] = None
+
+    @property
+    def feature_kind(self) -> str:
+        """EKF dispatch identifier — always 'corner'."""
+        return 'corner'
+
+    @property
+    def range(self) -> float:
+        return float(self.z[0])
+
+    @property
+    def bearing(self) -> float:
+        return float(self.z[1])
 
 
 @dataclass
@@ -69,18 +84,28 @@ class LineObs:
     ----------
     z               : (2,)  [rho_obs, alpha_obs]  in robot frame
     R               : (2,2) measurement noise covariance
+    kind            : 'line'  — identifies this as a line observation for
+                      data_assoc.py and main.py (obs.kind == 'line')
+    seg_p0 / seg_p1 : (2,) world-frame endpoints of the source segment —
+                      passed through to state.py for line rendering
+    cluster_midpoint: (2,) world-frame centre of the observed wall cluster.
+                      Used by the renderer to place the '+' marker.
     gt_rho          : ground-truth rho   (sim only)
     gt_alpha        : ground-truth alpha (sim only)
-    cluster_midpoint: (2,) world-frame centre of the observed wall cluster.
-                      Used by the renderer to place the '+' marker at the
-                      correct location when multiple sections of the same
-                      infinite line are observed.  None = use foot-of-perp.
     """
-    z:                np.ndarray    # (2,)  [rho_obs, alpha_obs]
-    R:                np.ndarray    # (2,2)
-    gt_rho:           Optional[float]          = None
-    gt_alpha:         Optional[float]          = None
-    cluster_midpoint: Optional[np.ndarray]     = None
+    z:                np.ndarray           # (2,)  [rho_obs, alpha_obs]
+    R:                np.ndarray           # (2,2)
+    kind:             str = 'line'         # always 'line' — used by data_assoc & main
+    seg_p0:           Optional[np.ndarray] = None
+    seg_p1:           Optional[np.ndarray] = None
+    cluster_midpoint: Optional[np.ndarray] = None
+    gt_rho:           Optional[float]      = None
+    gt_alpha:         Optional[float]      = None
+
+    @property
+    def feature_kind(self) -> str:
+        """EKF dispatch identifier — always 'line'."""
+        return 'line'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,8 +180,8 @@ def h_line(robot_pose: np.ndarray,
 # Analytic Jacobians
 # ─────────────────────────────────────────────────────────────────────────────
 
-def feature_jacobians(robot_pose:  np.ndarray,
-                      feature_type: str,
+def feature_jacobians(robot_pose:     np.ndarray,
+                      feature_type:   str,
                       feature_params: np.ndarray) -> Jacobians:
     """
     Compute analytic Jacobians of the measurement model.
@@ -164,7 +189,7 @@ def feature_jacobians(robot_pose:  np.ndarray,
     Parameters
     ----------
     robot_pose     : (3,) [xv, yv, theta_v]
-    feature_type   : 'corner' | 'line'
+    feature_type   : 'corner' | 'line'   (also accepts old kwarg name 'kind')
     feature_params : (2,)
         corner -> [cx, cy]
         line   -> [rho, alpha]
@@ -191,24 +216,18 @@ def _jacobian_corner(robot_pose: np.ndarray,
     beta = atan2(dy, dx) - theta_v
 
     dz/d[xv, yv, tv]:
-        dr/dxv    = -dx/r
-        dr/dyv    = -dy/r
-        dr/dtv    =  0
-        dbeta/dxv =  dy/r^2
-        dbeta/dyv = -dx/r^2
-        dbeta/dtv = -1
+        dr/dxv    = -dx/r,  dr/dyv    = -dy/r,  dr/dtv    =  0
+        dbeta/dxv =  dy/r², dbeta/dyv = -dx/r², dbeta/dtv = -1
 
     dz/d[cx, cy]:
-        dr/dcx    =  dx/r
-        dr/dcy    =  dy/r
-        dbeta/dcx = -dy/r^2
-        dbeta/dcy =  dx/r^2
+        dr/dcx    =  dx/r,  dr/dcy    =  dy/r
+        dbeta/dcx = -dy/r², dbeta/dcy =  dx/r²
     """
     xv, yv, tv = robot_pose
     cx, cy     = corner_pos
     dx, dy     = cx - xv, cy - yv
     r2         = dx**2 + dy**2
-    r          = np.sqrt(r2)
+    r          = max(np.sqrt(r2), 1e-6)
 
     H_v = np.array([
         [-dx/r,    -dy/r,    0.0],
@@ -229,27 +248,22 @@ def _jacobian_line(robot_pose: np.ndarray,
     Analytic Jacobian for line measurement.
 
     z = [rho_obs, alpha_obs]
-    rho_obs   = rho - xv*cos(alpha) - yv*sin(alpha)
+    rho_obs   = rho - xv*cos(α) - yv*sin(α)
     alpha_obs = alpha - tv
 
     dz/d[xv, yv, tv]:
-        drho_obs/dxv   = -cos(alpha)
-        drho_obs/dyv   = -sin(alpha)
-        drho_obs/dtv   =  0
-        dalpha_obs/dxv =  0
-        dalpha_obs/dyv =  0
-        dalpha_obs/dtv = -1
+        drho_obs/dxv   = -cos(α),  drho_obs/dyv   = -sin(α),  drho_obs/dtv   = 0
+        dalpha_obs/dxv =  0,        dalpha_obs/dyv =  0,        dalpha_obs/dtv = -1
 
     dz/d[rho, alpha]:
         drho_obs/drho      =  1
-        drho_obs/dalpha    =  xv*sin(alpha) - yv*cos(alpha)
+        drho_obs/dalpha    =  xv*sin(α) - yv*cos(α)
         dalpha_obs/drho    =  0
         dalpha_obs/dalpha  =  1
     """
     xv, yv, tv  = robot_pose
     rho, alpha  = line_params
-
-    ca, sa = np.cos(alpha), np.sin(alpha)
+    ca, sa      = np.cos(alpha), np.sin(alpha)
 
     H_v = np.array([
         [-ca,  -sa,  0.0],
@@ -265,7 +279,7 @@ def _jacobian_line(robot_pose: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Numerical Jacobian (for testing only)
+# Numerical Jacobians (for testing only)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def numerical_jacobian_corner(robot_pose:  np.ndarray,
@@ -276,40 +290,34 @@ def numerical_jacobian_corner(robot_pose:  np.ndarray,
     Finite-difference Jacobians for corner model.  Used in tests to validate
     the analytic versions.
 
-    Returns (H_v_num, H_f_num), both (2, 2or3).
+    Returns (H_v_num, H_f_num), both (2, 3) and (2, 2).
     """
-    def f(rp, cp):
-        return h_corner(rp, cp)
-
     H_v = np.zeros((2, 3))
     for i in range(3):
         rp_p = robot_pose.copy(); rp_p[i] += eps
         rp_m = robot_pose.copy(); rp_m[i] -= eps
-        H_v[:, i] = (f(rp_p, corner_pos) - f(rp_m, corner_pos)) / (2 * eps)
+        H_v[:, i] = (h_corner(rp_p, corner_pos) - h_corner(rp_m, corner_pos)) / (2 * eps)
 
     H_f = np.zeros((2, 2))
     for i in range(2):
         cp_p = corner_pos.copy(); cp_p[i] += eps
         cp_m = corner_pos.copy(); cp_m[i] -= eps
-        H_f[:, i] = (f(robot_pose, cp_p) - f(robot_pose, cp_m)) / (2 * eps)
+        H_f[:, i] = (h_corner(robot_pose, cp_p) - h_corner(robot_pose, cp_m)) / (2 * eps)
 
     return H_v, H_f
 
 
-def numerical_jacobian_line(robot_pose:   np.ndarray,
-                             line_params:  np.ndarray,
-                             eps:          float = 1e-6
+def numerical_jacobian_line(robot_pose:  np.ndarray,
+                             line_params: np.ndarray,
+                             eps:         float = 1e-6
                              ) -> Tuple[np.ndarray, np.ndarray]:
     """Finite-difference Jacobians for line model."""
-    def f(rp, lp):
-        return h_line(rp, lp[0], lp[1])
-
     H_v = np.zeros((2, 3))
     for i in range(3):
         rp_p = robot_pose.copy(); rp_p[i] += eps
         rp_m = robot_pose.copy(); rp_m[i] -= eps
-        dz   = f(rp_p, line_params) - f(rp_m, line_params)
-        # wrap alpha_obs component
+        dz   = h_line(rp_p, line_params[0], line_params[1]) \
+             - h_line(rp_m, line_params[0], line_params[1])
         dz[1] = _wrap(dz[1])
         H_v[:, i] = dz / (2 * eps)
 
@@ -317,7 +325,8 @@ def numerical_jacobian_line(robot_pose:   np.ndarray,
     for i in range(2):
         lp_p = line_params.copy(); lp_p[i] += eps
         lp_m = line_params.copy(); lp_m[i] -= eps
-        dz   = f(robot_pose, lp_p) - f(robot_pose, lp_m)
+        dz   = h_line(robot_pose, lp_p[0], lp_p[1]) \
+             - h_line(robot_pose, lp_m[0], lp_m[1])
         dz[1] = _wrap(dz[1])
         H_f[:, i] = dz / (2 * eps)
 
@@ -325,7 +334,7 @@ def numerical_jacobian_line(robot_pose:   np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Synthetic observation generator  (the "cheat" extractor)
+# Synthetic observation generator
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FeatureExtractor:
@@ -336,38 +345,53 @@ class FeatureExtractor:
     (a research problem in its own right), this class uses ground-truth world
     geometry to generate noisy corner and line observations directly.
 
-    This is the "cheat" described in the Phase 3 procedure notes:
-      - Check each world corner / wall segment for visibility from the robot
-      - If visible: generate a noisy observation with the correct noise model
-      - Return the list of observations for the EKF to consume
-
     Visibility criteria
     -------------------
     A feature is observable if:
       1. It is within sensor max_range of the robot.
-      2. It is within the sensor FOV (bearing within ±fov/2).
-      3. The line-of-sight from robot to feature is not occluded by any wall.
-         (Tested via World.ray_intersect toward the feature.)
+      2. It is within the sensor FOV (bearing within ±fov_half).
+      3. Line-of-sight is not occluded (ray-cast to the feature).
+
+    For lines, additionally:
+      4. The robot must be on the outward-normal side of the wall.
+      5. When a scan is provided, at least SUPPORT_MIN_HITS laser returns
+         must fall on the wall (prevents phantom wall observations).
+      6. Along-segment gaps in laser returns produce separate observations
+         (gap detection via angular-spacing analysis).
 
     Parameters
     ----------
-    fov_rad       : half-angle of FOV on each side  (total = 2 * fov_rad)
+    fov_rad       : total FOV in radians (half-angle = fov_rad/2)
     max_range     : maximum detection range (m)
-    noise_range   : 1-sigma range noise (m)
-    noise_bearing : 1-sigma bearing noise (rad)
+    noise_range   : 1-sigma range / rho noise (m)
+    noise_bearing : 1-sigma bearing / alpha noise (rad)
+    noise_rho     : if provided, overrides noise_range for line rho noise
+    noise_alpha   : if provided, overrides noise_bearing for line alpha noise
     rng           : numpy Generator
     """
+
+    # minimum laser hits on a segment before accepting it as a line obs
+    SUPPORT_MIN_HITS = 2
+    # gap multiplier: gap > GAP_MULTIPLIER × expected_angular_spacing → split
+    GAP_MULTIPLIER   = 3.0
+    # minimum cluster size after gap-split to emit an observation
+    GAP_MIN_CLUSTER  = 2
 
     def __init__(self,
                  fov_rad:       float,
                  max_range:     float,
                  noise_range:   float,
                  noise_bearing: float,
+                 noise_rho:     float | None = None,
+                 noise_alpha:   float | None = None,
                  rng: np.random.Generator | None = None):
-        self.fov_half      = fov_rad / 2.0        # ±fov_half from heading
+        self.fov_half      = fov_rad / 2.0
         self.max_range     = float(max_range)
         self.noise_range   = float(noise_range)
         self.noise_bearing = float(noise_bearing)
+        # line-specific noise (fall back to range/bearing noise if not given)
+        self.noise_rho     = float(noise_rho)   if noise_rho   is not None else self.noise_range
+        self.noise_alpha   = float(noise_alpha) if noise_alpha is not None else self.noise_bearing
         self._rng          = rng or np.random.default_rng()
 
     @classmethod
@@ -393,22 +417,18 @@ class FeatureExtractor:
 
         Parameters
         ----------
-        robot_pose : (3,) [xv, yv, theta_v]   — true pose (EKF uses estimated)
+        robot_pose : (3,) [xv, yv, theta_v]
         world      : env.World
-        scan       : ScanResult | None  — if provided, used for laser-support
-                     validation of line features (rejects phantom walls)
+        scan       : ScanResult | None — when provided, enables laser-support
+                     gating and gap detection for lines
 
         Returns
         -------
-        corners : list of CornerObs
-        lines   : list of LineObs
+        corners : list[CornerObs]
+        lines   : list[LineObs]
         """
         corners = self._extract_corners(robot_pose, world)
         lines   = self._extract_lines(robot_pose, world, scan)
-        # No deduplication needed: _extract_lines groups collinear segments,
-        # so each unique (rho,alpha) line is processed exactly once.
-        # Multiple observations per line (different rho_obs) represent
-        # distinct wall sections separated by a physical gap.
         return corners, lines
 
     # ── corners ───────────────────────────────────────────────────────────────
@@ -426,17 +446,14 @@ class FeatureExtractor:
             dx, dy = cx - xv, cy - yv
             dist   = np.sqrt(dx**2 + dy**2)
 
-            # range gate
             if dist > self.max_range or dist < 1e-6:
                 continue
 
-            # bearing gate
             bearing = _wrap(np.arctan2(dy, dx) - tv)
             if abs(bearing) > self.fov_half:
                 continue
 
-            # occlusion check — cast ray toward corner;
-            # hit must be at least as far as the corner itself
+            # occlusion check
             angle  = np.arctan2(dy, dx)
             result = world.ray_intersect(origin, angle, self.max_range)
             if result is None:
@@ -445,16 +462,13 @@ class FeatureExtractor:
             if hit_dist < dist - 0.15:   # 15 cm tolerance for wall junctions
                 continue
 
-            # generate noisy observation
-            r_noisy    = dist    + self._rng.normal(0, self.noise_range)
-            beta_noisy = bearing + self._rng.normal(0, self.noise_bearing)
-            r_noisy    = max(0.0, r_noisy)
-            beta_noisy = _wrap(beta_noisy)
+            r_noisy    = max(0.0, dist + self._rng.normal(0, self.noise_range))
+            beta_noisy = _wrap(bearing + self._rng.normal(0, self.noise_bearing))
 
             obs.append(CornerObs(
                 z      = np.array([r_noisy, beta_noisy]),
                 R      = R.copy(),
-                kind   = corner.kind,
+                kind   = corner.kind,   # 'convex' | 'concave' — geometry type
                 gt_pos = corner.pos.copy(),
             ))
 
@@ -462,25 +476,16 @@ class FeatureExtractor:
 
     # ── lines ────────────────────────────────────────────────────────────────
 
-    # minimum fraction of a segment's length that must be covered by laser
-    # returns before accepting the segment as a valid line observation.
-    SUPPORT_FRACTION = 0.25
-    # minimum absolute number of supporting laser hits
-    SUPPORT_MIN_HITS = 2
-    # gap detection: a spacing between adjacent along-segment hits is a real
-    # gap if it exceeds GAP_MULTIPLIER * expected_angular_spacing at that range.
-    # Higher = fewer splits (more tolerant of angular thinning).
-    GAP_MULTIPLIER   = 3.0
-    # minimum cluster size to emit a sub-segment observation after splitting
-    GAP_MIN_CLUSTER  = 2
-
     def _extract_lines(self,
                        robot_pose: np.ndarray,
                        world,
                        scan=None) -> List[LineObs]:
         """
-        Extract line observations, grouping collinear segments so that gaps
-        between adjacent collinear wall sections produce separate observations.
+        Extract line observations with:
+          - Facing-side check (only observe walls from the outward-normal side)
+          - Collinear segment grouping (one (rho,alpha) → one or more obs)
+          - Laser-support gating when a scan is provided
+          - Gap detection: along-segment laser gaps → separate observations
         """
         xv, yv, tv = robot_pose
         origin      = np.array([xv, yv])
@@ -488,52 +493,51 @@ class FeatureExtractor:
         obs         = []
         hit_pts     = scan.valid_hits if scan is not None else None
 
-        # Group segments by shared polar line identity
+        # Group segments that share the same infinite polar line
         groups: dict = {}
         for seg in world.segments:
             rho, alpha = seg.as_polar_line()
             key = (round(rho, 2), round(np.degrees(alpha), 1))
             groups.setdefault(key, []).append(seg)
 
-        for (rho_q, alpha_q_deg), seg_list in groups.items():
+        for _key, seg_list in groups.items():
             ref_seg    = seg_list[0]
             rho, alpha = ref_seg.as_polar_line()
             seg_normal = ref_seg.normal
             seg_dir    = ref_seg.direction
 
-            # facing-side check
-            robot_side = np.dot(origin - ref_seg.p0, seg_normal)
-            if robot_side <= 0:
+            # 1. Facing-side check: robot must be on the outward-normal side
+            if np.dot(origin - ref_seg.p0, seg_normal) <= 0:
                 continue
 
-            # noiseless measurement
+            # 2. Noiseless measurement — reject if rho_obs < 0
             z_clean = h_line(robot_pose, rho, alpha)
             if z_clean[0] < 0:
                 continue
 
-            # range gate: any segment must be within max_range
+            # 3. Range gate: closest point on any segment in group
             any_close = any(
                 _closest_point_on_segment(origin, seg.p0, seg.p1)[1] <= self.max_range
                 for seg in seg_list)
             if not any_close:
                 continue
 
-            # bearing gate: any closest point must be within FOV
+            # 4. FOV gate: at least one close point is within bearing cone
             in_fov = False
             for seg in seg_list:
                 closest, _ = _closest_point_on_segment(origin, seg.p0, seg.p1)
-                bearing = _wrap(np.arctan2(closest[1]-yv, closest[0]-xv) - tv)
-                if abs(bearing) <= self.fov_half:
+                brg = _wrap(np.arctan2(closest[1] - yv, closest[0] - xv) - tv)
+                if abs(brg) <= self.fov_half:
                     in_fov = True
                     break
             if not in_fov:
                 continue
 
+            # 5. Laser-support gating + gap detection (only when scan available)
             if hit_pts is not None and len(hit_pts) > 0:
                 tol_perp     = max(0.10, 3 * self.noise_range)
                 endpoint_tol = max(0.15, 4 * self.noise_range)
 
-                # collect hits from ALL segments in group
                 group_on = np.zeros(len(hit_pts), dtype=bool)
                 for seg in seg_list:
                     rel    = hit_pts - seg.p0
@@ -552,42 +556,57 @@ class FeatureExtractor:
                 if int(group_on.sum()) < self.SUPPORT_MIN_HITS:
                     continue
 
-                # gap split on merged hit cloud
                 support_hits = hit_pts[group_on]
-                common_p0    = ref_seg.p0
-                t_along      = (support_hits - common_p0) @ seg_dir
+                t_along      = (support_hits - ref_seg.p0) @ seg_dir
                 sort_idx     = np.argsort(t_along)
                 t_sorted     = t_along[sort_idx]
                 pts_sorted   = support_hits[sort_idx]
 
                 clusters = self._split_into_clusters(
                     t_sorted, pts_sorted,
-                    seg_p0=common_p0, seg_dir=seg_dir, robot_pos=origin)
+                    seg_p0=ref_seg.p0, seg_dir=seg_dir, robot_pos=origin)
 
                 for cluster_pts in clusters:
                     if len(cluster_pts) < self.GAP_MIN_CLUSTER:
                         continue
-                    full_mean    = support_hits.mean(axis=0)
                     cluster_mean = cluster_pts.mean(axis=0)
+                    full_mean    = support_hits.mean(axis=0)
                     delta_rho    = float(np.dot(cluster_mean - full_mean, seg_normal))
                     rho_obs_c    = z_clean[0] + delta_rho
                     if rho_obs_c < 0:
                         continue
-                    rho_n   = rho_obs_c + self._rng.normal(0, self.noise_range)
-                    alpha_n = _wrap(z_clean[1] + self._rng.normal(0, self.noise_bearing))
+                    rho_n   = rho_obs_c + self._rng.normal(0, self.noise_rho)
+                    alpha_n = _wrap(z_clean[1] + self._rng.normal(0, self.noise_alpha))
+                    # find which segment this cluster came from (best overlap)
+                    src_seg = _best_segment_for_cluster(cluster_pts, seg_list)
                     obs.append(LineObs(
-                        z=np.array([rho_n, alpha_n]), R=R.copy(),
-                        gt_rho=rho, gt_alpha=alpha,
-                        cluster_midpoint=cluster_mean.copy()))
+                        z                = np.array([rho_n, alpha_n]),
+                        R                = R.copy(),
+                        kind             = 'line',
+                        seg_p0           = src_seg.p0.copy(),
+                        seg_p1           = src_seg.p1.copy(),
+                        cluster_midpoint = cluster_mean.copy(),
+                        gt_rho           = rho,
+                        gt_alpha         = alpha,
+                    ))
+
             else:
-                rho_n   = z_clean[0] + self._rng.normal(0, self.noise_range)
-                alpha_n = _wrap(z_clean[1] + self._rng.normal(0, self.noise_bearing))
+                # No scan: one observation per group, use ref segment endpoints
+                rho_n   = z_clean[0] + self._rng.normal(0, self.noise_rho)
+                alpha_n = _wrap(z_clean[1] + self._rng.normal(0, self.noise_alpha))
+                mid     = ref_seg.midpoint
                 obs.append(LineObs(
-                    z=np.array([rho_n, alpha_n]), R=R.copy(),
-                    gt_rho=rho, gt_alpha=alpha))
+                    z                = np.array([rho_n, alpha_n]),
+                    R                = R.copy(),
+                    kind             = 'line',
+                    seg_p0           = ref_seg.p0.copy(),
+                    seg_p1           = ref_seg.p1.copy(),
+                    cluster_midpoint = mid.copy(),
+                    gt_rho           = rho,
+                    gt_alpha         = alpha,
+                ))
 
         return obs
-
 
     # ── gap splitting ─────────────────────────────────────────────────────────
 
@@ -599,16 +618,10 @@ class FeatureExtractor:
                              robot_pos:  np.ndarray
                              ) -> List[np.ndarray]:
         """
-        Split along-segment hit points into contiguous clusters by detecting
-        gaps that exceed the expected angular ray spacing at that range.
-
-        A gap between adjacent hits is "real" (open space, not angular thinning)
-        when it is wider than GAP_MULTIPLIER × expected_angular_spacing, where
-        expected_angular_spacing = range * d_theta / cos(incidence_angle).
-
-        Returns a list of (K_i, 2) arrays, one per cluster.
+        Split sorted along-segment hit points into contiguous clusters by
+        detecting gaps wider than GAP_MULTIPLIER × expected angular spacing.
         """
-        d_theta = np.radians(180.0 / 180.0)   # 1-deg ray spacing (181 rays, 180-deg FOV)
+        d_theta    = np.radians(1.0)   # ~1 degree between adjacent rays
         seg_normal = np.array([-seg_dir[1], seg_dir[0]])
 
         if len(t_sorted) == 0:
@@ -618,16 +631,14 @@ class FeatureExtractor:
 
         cluster_starts = [0]
         for i in range(len(t_sorted) - 1):
-            gap = t_sorted[i+1] - t_sorted[i]
-            # midpoint of candidate gap in world frame
-            t_mid      = 0.5 * (t_sorted[i] + t_sorted[i+1])
-            mid_world  = seg_p0 + t_mid * seg_dir
-            range_mid  = np.linalg.norm(mid_world - robot_pos)
-            to_mid     = mid_world - robot_pos
-            cos_inc    = abs(np.dot(to_mid / (range_mid + 1e-9), seg_normal))
-            expected   = range_mid * d_theta / max(cos_inc, 0.05)
-            threshold  = self.GAP_MULTIPLIER * expected
-            if gap > threshold:
+            gap       = t_sorted[i+1] - t_sorted[i]
+            t_mid     = 0.5 * (t_sorted[i] + t_sorted[i+1])
+            mid_world = seg_p0 + t_mid * seg_dir
+            range_mid = np.linalg.norm(mid_world - robot_pos)
+            to_mid    = mid_world - robot_pos
+            cos_inc   = abs(np.dot(to_mid / (range_mid + 1e-9), seg_normal))
+            expected  = range_mid * d_theta / max(cos_inc, 0.05)
+            if gap > self.GAP_MULTIPLIER * expected:
                 cluster_starts.append(i + 1)
 
         clusters = []
@@ -636,42 +647,21 @@ class FeatureExtractor:
             clusters.append(pts_sorted[start:end])
         return clusters
 
-    # ── deduplication ────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _deduplicate_lines(lines: List[LineObs],
-                           rho_tol:   float = 0.15,
-                           alpha_tol: float = 0.05) -> List[LineObs]:
-        """
-        Deduplicate line observations with identical (rho, alpha) that arise
-        from collinear segments being processed twice.  Observations from
-        gap-split clusters on the same infinite line have the same gt_alpha
-        but deliberately different rho_obs (z[0]) and are NOT deduplicated.
-        """
-        kept = []
-        for obs in lines:
-            duplicate = False
-            for existing in kept:
-                drho   = abs(obs.z[0]     - existing.z[0])
-                dalpha = abs(_wrap(obs.z[1] - existing.z[1]))
-                if drho < rho_tol and dalpha < alpha_tol:
-                    duplicate = True
-                    break
-            if not duplicate:
-                kept.append(obs)
-        return kept
-
     # ── noise covariances ─────────────────────────────────────────────────────
 
     def _R_corner(self) -> np.ndarray:
-        return np.diag([self.noise_range**2, self.noise_bearing**2])
+        sr = max(self.noise_range,   1e-4)
+        sb = max(self.noise_bearing, 1e-4)
+        return np.diag([sr**2, sb**2])
 
     def _R_line(self) -> np.ndarray:
-        return np.diag([self.noise_range**2, self.noise_bearing**2])
+        sr = max(self.noise_rho,   1e-4)
+        sa = max(self.noise_alpha, 1e-4)
+        return np.diag([sr**2, sa**2])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Module-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _wrap(angle) -> float:
@@ -683,11 +673,26 @@ def _closest_point_on_segment(p: np.ndarray,
                                a: np.ndarray,
                                b: np.ndarray
                                ) -> Tuple[np.ndarray, float]:
-    """
-    Return (closest_point, distance) from point p to segment [a, b].
-    """
+    """Return (closest_point, distance) from point p to segment [a, b]."""
     ab = b - a
     t  = np.dot(p - a, ab) / (np.dot(ab, ab) + 1e-12)
     t  = np.clip(t, 0.0, 1.0)
     c  = a + t * ab
     return c, float(np.linalg.norm(p - c))
+
+
+def _best_segment_for_cluster(cluster_pts: np.ndarray,
+                               seg_list: list) -> object:
+    """
+    Return the segment in seg_list that has the most cluster points
+    projecting onto it.  Used to pick seg_p0/seg_p1 for the LineObs.
+    """
+    best_seg   = seg_list[0]
+    best_count = 0
+    for seg in seg_list:
+        t_proj = (cluster_pts - seg.p0) @ seg.direction
+        count  = int(((t_proj >= 0) & (t_proj <= seg.length)).sum())
+        if count > best_count:
+            best_count = count
+            best_seg   = seg
+    return best_seg
