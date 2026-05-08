@@ -22,7 +22,7 @@ from typing import Tuple, TYPE_CHECKING
 from montecarlo.virtual_features import build_virtual_features
 from montecarlo.sampler           import sample_points
 from montecarlo.navigability      import navigable_mask
-from montecarlo.probability       import score_points_vectorised
+from montecarlo.probability       import score_points_vectorised, boundary_scores
 
 if TYPE_CHECKING:
     from slam.state import SLAMState
@@ -119,7 +119,19 @@ def build_uncertainty_map(state:        'SLAMState',
         result.set_band(uncertainty_lo, uncertainty_hi)
         return result
 
-    scores = score_points_vectorised(navigable_pts, state, virtual_lines)
+    # Real-feature Gaussian scores (corners + lines)
+    feature_scores = score_points_vectorised(navigable_pts, state, virtual_lines)
+
+    # Boundary proximity score: 0.5 at walls, decaying inward.
+    # This implements the paper's intent that unexplored frontiers
+    # near the map boundary score near 0.5 regardless of room size.
+    b_scores = boundary_scores(navigable_pts, bounds)
+
+    # Combine: boundary term provides a 0.5 baseline near walls; real
+    # features pull well-mapped regions toward 0 (free) or >0.5 (occupied).
+    # Take the maximum so known-feature regions still dominate.
+    scores = np.maximum(feature_scores, b_scores)
+    np.clip(scores, 0.0, 1.0, out=scores)
 
     result = UncertaintyMap(
         points  = navigable_pts,

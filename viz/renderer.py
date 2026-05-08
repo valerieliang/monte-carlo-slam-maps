@@ -166,81 +166,7 @@ class Renderer:
                          markeredgewidth=1.6, alpha=PAL['corner_alpha'],
                          zorder=4)
 
-        # ── Legend ───────────────────────────────────────────────────────────
-        # Ground truth
-        gt_entries = [
-            mlines.Line2D([], [], color=PAL['wall'], linewidth=2,
-                          label='wall — ground truth'),
-            mlines.Line2D([], [], color=PAL['corner_cvx'], marker='s',
-                          linestyle='none', markerfacecolor='none',
-                          markeredgewidth=1.5, markersize=6,
-                          label='convex corner — GT'),
-            mlines.Line2D([], [], color=PAL['corner_ccv'], marker='s',
-                          linestyle='none', markerfacecolor='none',
-                          markeredgewidth=1.5, markersize=6,
-                          label='concave corner — GT'),
-        ]
-
-        # Robot & sensor
-        sensor_entries = [
-            mlines.Line2D([], [], color=PAL['robot_body'], marker='o',
-                          linestyle='none', markersize=6,
-                          label='robot pose'),
-            mlines.Line2D([], [], color=PAL['trail'],
-                          linewidth=1.2, alpha=0.6,
-                          label='robot trail'),
-            mlines.Line2D([], [], color=PAL['laser'], marker='.',
-                          linestyle='none', markersize=5,
-                          label='laser returns'),
-        ]
-
-        # Raw per-frame feature observations  (F to toggle)
-        feat_entries = [
-            mlines.Line2D([], [], color=PAL['feat_corner'], marker='o',
-                          linestyle='none', markersize=7,
-                          markerfacecolor='none', markeredgewidth=2.0,
-                          label='observed corner — this frame'),
-            mlines.Line2D([], [], color=PAL['feat_line'], marker='P',
-                          linestyle='none', markersize=7,
-                          label='observed wall midpoint — this frame'),
-        ]
-
-        # SLAM map overlay  (M to toggle)
-        slam_entries = [
-            mlines.Line2D([], [], color=PAL['slam_corner'], marker='x',
-                          linestyle='none', markersize=9,
-                          markeredgewidth=2.5,
-                          label='SLAM corner estimate  ✕'),
-            mlines.Line2D([], [], color=PAL['slam_corner'],
-                          marker='o', markersize=8, linestyle='none',
-                          markerfacecolor='none', markeredgewidth=1.0,
-                          alpha=0.5,
-                          label='  └ 2σ position uncertainty'),
-            mlines.Line2D([], [], color=PAL['slam_line'],
-                          linestyle='--', linewidth=1.8, alpha=0.8,
-                          label='SLAM wall estimate  (dashed)'),
-            mlines.Line2D([], [], color=PAL['slam_line'], marker='D',
-                          linestyle='none', markersize=6,
-                          label='  └ wall midpoint  ◆'),
-            mlines.Line2D([], [], color=PAL['slam_line'],
-                          marker='o', markersize=8, linestyle='none',
-                          markerfacecolor='none', markeredgewidth=1.0,
-                          alpha=0.4,
-                          label='  └ 2σ wall uncertainty'),
-        ]
-
-        leg = gt_entries + sensor_entries + feat_entries + slam_entries
-        self.ax.legend(
-            handles        = leg,
-            loc            = 'upper right',
-            fontsize       = 7,
-            framealpha     = 0.30,
-            facecolor      = '#1e2130',
-            edgecolor      = '#334155',
-            labelcolor     = '#94a3b8',
-            title          = 'Legend    F = features    M = SLAM map',
-            title_fontsize = 7,
-        )
+        self.update_legend()
 
     # -------------------------------------------------------- dynamic artists
 
@@ -365,7 +291,135 @@ class Renderer:
         else:
             self._feat_line_pts.set_data([], [])
 
-    # --------------------------------------------------- Phase 5 stub
+    # --------------------------------------------------- legend (dynamic)
+
+    def update_legend(self,
+                      show_heatmap: bool = False,
+                      show_features: bool = True,
+                      show_slam: bool = True) -> None:
+        """
+        Rebuild the legend. Call whenever an overlay is toggled so the
+        legend reflects the currently visible layers.
+        """
+        # ── always-visible ────────────────────────────────────────────────
+        base_entries = [
+            mlines.Line2D([], [], color=PAL['wall'], linewidth=2,
+                          label='Wall (ground truth)'),
+            mlines.Line2D([], [], color=PAL['corner_cvx'], marker='s',
+                          linestyle='none', markerfacecolor='none',
+                          markeredgewidth=1.5, markersize=6,
+                          label='Convex corner (GT)'),
+            mlines.Line2D([], [], color=PAL['corner_ccv'], marker='s',
+                          linestyle='none', markerfacecolor='none',
+                          markeredgewidth=1.5, markersize=6,
+                          label='Concave corner (GT)'),
+            mlines.Line2D([], [], color=PAL['robot_body'], marker='o',
+                          linestyle='none', markersize=7,
+                          label='Robot'),
+            mlines.Line2D([], [], color=PAL['robot_arrow'],
+                          linewidth=2, label='Heading arrow'),
+            mlines.Line2D([], [], color=PAL['trail'],
+                          linewidth=1.2, alpha=0.7,
+                          label='Robot trail'),
+            mlines.Line2D([], [], color=PAL['laser'], marker='.',
+                          linestyle='none', markersize=5,
+                          label='Laser returns'),
+        ]
+
+        # ── F — raw feature observations ──────────────────────────────────
+        feat_entries = []
+        if show_features:
+            feat_entries = [
+                mlines.Line2D([], [], color=PAL['feat_corner'], marker='o',
+                              linestyle='none', markersize=7,
+                              markerfacecolor='none', markeredgewidth=2.0,
+                              label='Observed corner (frame)'),
+                mlines.Line2D([], [], color=PAL['feat_line'], marker='P',
+                              linestyle='none', markersize=7,
+                              label='Observed wall midpoint (frame)'),
+            ]
+
+        # ── M — SLAM map ───────────────────────────────────────────────────
+        slam_entries = []
+        if show_slam:
+            slam_entries = [
+                mlines.Line2D([], [], color=PAL['slam_corner'], marker='x',
+                              linestyle='none', markersize=9,
+                              markeredgewidth=2.5,
+                              label='SLAM corner estimate'),
+                mlines.Line2D([], [], color=PAL['slam_corner'],
+                              marker='o', markersize=8, linestyle='none',
+                              markerfacecolor='none', markeredgewidth=1.0,
+                              alpha=0.5,
+                              label='  2σ corner uncertainty'),
+                mlines.Line2D([], [], color=PAL['slam_line'],
+                              linestyle='--', linewidth=1.8, alpha=0.8,
+                              label='SLAM wall estimate'),
+                mlines.Line2D([], [], color=PAL['slam_line'], marker='D',
+                              linestyle='none', markersize=6,
+                              label='  Wall segment midpoint'),
+                mlines.Line2D([], [], color=PAL['slam_line'],
+                              marker='o', markersize=8, linestyle='none',
+                              markerfacecolor='none', markeredgewidth=1.0,
+                              alpha=0.4,
+                              label='  2σ wall uncertainty'),
+            ]
+
+        # ── U — MC heatmap ─────────────────────────────────────────────────
+        heatmap_entries = []
+        if show_heatmap:
+            heatmap_entries = [
+                mlines.Line2D([], [], color='#0f2a47', marker='o',
+                              linestyle='none', markersize=7,
+                              markerfacecolor='#0f2a47',
+                              label='Free space (well mapped)'),
+                mlines.Line2D([], [], color='#1e6b8a', marker='o',
+                              linestyle='none', markersize=7,
+                              markerfacecolor='#1e6b8a',
+                              label='Partially explored'),
+                mlines.Line2D([], [], color='#f59e0b', marker='o',
+                              linestyle='none', markersize=9,
+                              markerfacecolor='#f59e0b',
+                              label='Uncertain frontier ← nav target'),
+                mlines.Line2D([], [], color='#c2410c', marker='o',
+                              linestyle='none', markersize=7,
+                              markerfacecolor='#c2410c',
+                              label='Near mapped feature'),
+            ]
+
+        # ── key bindings in title ─────────────────────────────────────────
+        active = []
+        if show_features: active.append('F=feats')
+        if show_slam:     active.append('M=SLAM')
+        if show_heatmap:  active.append('U=heatmap')
+        inactive = []
+        if not show_features: inactive.append('F')
+        if not show_slam:     inactive.append('M')
+        if not show_heatmap:  inactive.append('U')
+
+        on_str  = '  '.join(active)
+        off_str = ('  off: ' + '/'.join(inactive)) if inactive else ''
+        title   = f'Legend — {on_str}{off_str}'
+
+        all_entries = (base_entries + feat_entries +
+                       slam_entries + heatmap_entries)
+
+        # Remove old legend and draw fresh
+        legend = self.ax.get_legend()
+        if legend is not None:
+            legend.remove()
+
+        self.ax.legend(
+            handles        = all_entries,
+            loc            = 'upper right',
+            fontsize       = 7,
+            framealpha     = 0.30,
+            facecolor      = '#1e2130',
+            edgecolor      = '#334155',
+            labelcolor     = '#94a3b8',
+            title          = title,
+            title_fontsize = 7,
+        )
 
     def _draw_mc(self, mc_points) -> None:
         pass

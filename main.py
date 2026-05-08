@@ -45,7 +45,7 @@ from slam.update       import update_single, init_corner, init_line
 from slam.data_assoc   import associate_observations
 from viz.renderer      import Renderer
 from viz.covariance    import draw_slam_features
-from viz.heatmap       import HeatmapRenderer, draw_goal
+from viz.heatmap       import HeatmapRenderer
 from montecarlo.uncertainty_map import build_uncertainty_map
 
 
@@ -152,8 +152,6 @@ def run(cfg: Config, preset: str | None = None) -> None:
     mc_rng        = np.random.default_rng()
     mc_every      = max(1, int(1.0 / (cfg.sim.dt * cfg.sim.render_fps)))  # every ~1 s
     mc_counter    = 0
-    goal_artists  = []
-
     print("[main] Phase 5 running.  U toggles MC heatmap.  M = SLAM.  Q = quit.")
 
     while plt.fignum_exists(renderer.fig.number):
@@ -166,11 +164,17 @@ def run(cfg: Config, preset: str | None = None) -> None:
         if keys.toggle_features:
             show_features        = not show_features
             keys.toggle_features = False
+            renderer.update_legend(show_heatmap=show_heatmap,
+                                   show_features=show_features,
+                                   show_slam=show_slam)
             print(f"[main] Feature overlay {'ON' if show_features else 'OFF'}")
 
         if keys.toggle_slam:
             show_slam        = not show_slam
             keys.toggle_slam = False
+            renderer.update_legend(show_heatmap=show_heatmap,
+                                   show_features=show_features,
+                                   show_slam=show_slam)
             print(f"[main] SLAM map {'ON' if show_slam else 'OFF'}")
 
         if keys.toggle_heatmap:
@@ -178,6 +182,9 @@ def run(cfg: Config, preset: str | None = None) -> None:
             keys.toggle_heatmap = False
             if not show_heatmap:
                 heatmap.clear()
+            renderer.update_legend(show_heatmap=show_heatmap,
+                                   show_features=show_features,
+                                   show_slam=show_slam)
             print(f"[main] MC heatmap {'ON' if show_heatmap else 'OFF'}")
 
         if keys.reset:
@@ -186,7 +193,6 @@ def run(cfg: Config, preset: str | None = None) -> None:
             slam_state = SLAMState(init_pose=robot.pose,
                                    init_pose_cov=np.zeros((3, 3)))
             heatmap.clear()
-            goal_artists = draw_goal(renderer.ax, None, goal_artists)
             mc_counter   = 0
             keys.reset   = False
             print("[main] Robot + SLAM state reset.")
@@ -203,8 +209,13 @@ def run(cfg: Config, preset: str | None = None) -> None:
             keys._held.clear()
             slam_artists  = []
             heatmap       = HeatmapRenderer(renderer.ax)
-            goal_artists  = []
             mc_counter    = 0
+            show_features = True
+            show_slam     = True
+            show_heatmap  = False
+            renderer.update_legend(show_heatmap=False,
+                                   show_features=True,
+                                   show_slam=True)
             continue
 
         # -- physics + sensing -----------------------------------------------
@@ -256,10 +267,6 @@ def run(cfg: Config, preset: str | None = None) -> None:
             )
             heatmap.update(umap)
 
-            # Pick navigation target: max P(p)/distance among uncertain pts
-            if len(umap.uncertain_points) > 0:
-                goal = _select_goal(umap, robot.pos)
-                goal_artists = draw_goal(renderer.ax, goal, goal_artists)
 
         # -- render at target FPS --------------------------------------------
         now = time.perf_counter()
@@ -380,20 +387,6 @@ def _draw_slam(ax, state: SLAMState) -> list:
     return artists
 
 
-# ---------------------------------------------------------------- goal selector
-
-def _select_goal(umap, robot_pos: np.ndarray) -> np.ndarray:
-    """
-    Choose the navigation target from uncertain MC points (Eq. 11).
-
-    Returns the point maximising P(p) / distance(robot, p).
-    """
-    pts    = umap.uncertain_points
-    scores = umap.uncertain_scores
-    dists  = np.linalg.norm(pts - robot_pos, axis=1)
-    dists  = np.maximum(dists, 0.1)   # avoid div-by-zero
-    metric = scores / dists
-    return pts[np.argmax(metric)]
 
 
 # ---------------------------------------------------------------------- CLI

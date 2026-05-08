@@ -219,12 +219,12 @@ def score_points_vectorised(points:        np.ndarray,
     if L == 0:
         return np.full(N, 0.5)
 
-    # Real features use uniform weighting sigma = 1/n_real (or 1 if no features)
-    # Virtual boundary lines use sigma = 1: their covariance diag(0.32, 0.32)
-    # is chosen by the paper so that peak probability = 0.5 at unit weight.
-    sigma_real    = 1.0 / n_real if n_real > 0 else 1.0
-    sigma_virtual = 1.0
-    scores        = np.zeros(N)
+    # Uniform weighting across ALL features (real + virtual): sigma = 1/L
+    # The paper's virtual-line covariance diag(0.32≈1/π, 0.32) is derived
+    # so that with 4 virtual lines at sigma=1/4, the sum peaks at 0.5
+    # at any boundary point — exactly the uncertainty threshold.
+    sigma  = 1.0 / L
+    scores = np.zeros(N)
 
     # ── Real features ──────────────────────────────────────────────────────
     for feat in state.features:
@@ -232,18 +232,21 @@ def score_points_vectorised(points:        np.ndarray,
         cov  = _regularise_cov(state.feature_cov(feat.idx))
 
         if feat.kind == 'corner':
-            scores += sigma_real * _corner_prob_batch(points, mean, cov)
+            scores += sigma * _corner_prob_batch(points, mean, cov)
         else:
             rho, alpha = mean
             p0 = feat.seg_p0 if feat.seg_p0 is not None else mean
             p1 = feat.seg_p1 if feat.seg_p1 is not None else mean
-            scores += sigma_real * _line_prob_batch(points, rho, alpha, cov, p0, p1)
+            scores += sigma * _line_prob_batch(points, rho, alpha, cov, p0, p1)
 
-    # ── Virtual boundary lines — always sigma = 1 ──────────────────────────
+    # ── Virtual boundary lines ─────────────────────────────────────────────
     for vl in virtual_lines:
         cov = _regularise_cov(vl.cov)
-        scores += sigma_virtual * _line_prob_batch(
+        scores += sigma * _line_prob_batch(
             points, vl.rho, vl.alpha, cov, vl.seg_p0, vl.seg_p1)
+
+    # Clamp to [0, 1] — scores can exceed 1.0 near dense feature clusters
+    np.clip(scores, 0.0, 1.0, out=scores)
 
     return scores
 
@@ -299,6 +302,51 @@ def _line_prob_batch(points:  np.ndarray,
     result    = norm * np.exp(exponent)
     result[~in_region] = 0.0
     return result
+
+
+# ── Boundary score (replaces virtual-line Gaussian for large rooms) ───────────
+
+def boundary_scores(points:       np.ndarray,
+                    bounds:        tuple,
+                    decay_length:  float | None = None) -> np.ndarray:
+    """
+    Score each point by proximity to the unexplored boundary.
+
+    Returns values in [0, 0.5]:
+      0.5  at the boundary
+      decaying inward with length scale decay_length
+
+    This replaces the virtual-line Gaussian model for environments larger
+    than a few metres, where the narrow paper covariance (0.32) would give
+    near-zero scores in the room interior.
+
+    Parameters
+    ----------
+    points       : (N, 2)
+    bounds       : (xmin, xmax, ymin, ymax) — sampling bounds
+    decay_length : length scale in metres.  Defaults to
+                   max(width, height) / 4.0 so the score drops to ~0.07
+                   at the room centre.
+    """
+    xmin, xmax, ymin, ymax = bounds
+    w = xmax - xmin
+    h = ymax - ymin
+
+    if decay_length is None:
+        decay_length = max(w, h) / 4.0
+
+    # Distance from each point to each of the 4 walls
+    d_south = points[:, 1] - ymin   # dist to south wall
+    d_north = ymax - points[:, 1]   # dist to north wall
+    d_west  = points[:, 0] - xmin   # dist to west wall
+    d_east  = xmax - points[:, 0]   # dist to east wall
+
+    # Minimum distance to any boundary
+    d_min = np.minimum(np.minimum(d_south, d_north),
+                       np.minimum(d_west,  d_east))
+    d_min = np.maximum(d_min, 0.0)
+
+    return 0.5 * np.exp(-d_min / decay_length)
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
