@@ -79,12 +79,44 @@ class UncertaintyMap:
 # Feature position helper
 # ---------------------------------------------------------------------------
 
+def _feature_anchors(feat, state: 'SLAMState',
+                      spacing: float = 2.0) -> np.ndarray:
+    """
+    Return one or more XY anchor positions for a feature's spatial kernel.
+
+    Corners: single point at the corner position.
+
+    Lines: a series of points sampled along the segment at `spacing` intervals.
+    Using multiple anchors ensures the full wall length influences nearby
+    floor points — a single midpoint only covers the centre of long walls.
+    """
+    mean = state.feature_mean(feat.idx)
+
+    if feat.kind == 'corner':
+        return mean.reshape(1, 2)
+
+    # Line feature — sample anchors along segment
+    if feat.seg_p0 is not None and feat.seg_p1 is not None:
+        p0, p1 = feat.seg_p0, feat.seg_p1
+        length = np.linalg.norm(p1 - p0)
+        if length < 1e-6:
+            return (0.5 * (p0 + p1)).reshape(1, 2)
+        n = max(1, int(np.ceil(length / spacing)))
+        ts = np.linspace(0.0, 1.0, n + 1)
+        return np.array([p0 + t * (p1 - p0) for t in ts])
+
+    # Fallback: foot-of-perpendicular from origin
+    rho, alpha = mean
+    pt = np.array([rho * np.cos(alpha), rho * np.sin(alpha)])
+    return pt.reshape(1, 2)
+
+
+# keep the old name as a compat alias returning the midpoint
 def _feature_xy(feat, state: 'SLAMState') -> np.ndarray:
-    """Return the XY world position of a feature."""
+    """Return the midpoint XY position of a feature (legacy, use _feature_anchors)."""
     mean = state.feature_mean(feat.idx)
     if feat.kind == 'corner':
         return mean
-    # Line: use stored segment midpoint if available, else foot-of-perp
     if feat.seg_p0 is not None and feat.seg_p1 is not None:
         return 0.5 * (feat.seg_p0 + feat.seg_p1)
     rho, alpha = mean
@@ -128,25 +160,26 @@ def _score_uncertainty(points:       np.ndarray,
     two_s2 = 2.0 * spatial_sigma ** 2
 
     for feat in state.features:
-        pos       = _feature_xy(feat, state)
         obs_count = max(feat.obs_count, 1)
 
-        # Harmonic decay: w = 1 / (1 + obs_count)
-        #   obs=1  → w=0.50  (freshly seen, uncertain)
-        #   obs=5  → w=0.17  (a few observations)
-        #   obs=20 → w=0.05  (well-mapped, fading)
-        #   obs=60 → w=0.016 (fully mapped, nearly invisible)
+        # Harmonic decay: w = 1/(1+obs) so fresh features score high,
+        # well-mapped ones fade toward zero.
         w = 1.0 / (1.0 + obs_count)
-
         if w < 0.01:
             continue   # fully mapped, skip
 
-        # Fixed spatial Gaussian kernel — width independent of EKF covariance
-        dists_sq   = np.sum((points - pos) ** 2, axis=1)
-        kernel     = np.exp(-dists_sq / two_s2)
+        # Anchor points along the feature (multiple for long walls)
+        anchors = _feature_anchors(feat, state, spacing=spatial_sigma)
 
-        # Take max so dense feature clusters don't double-count
-        scores = np.maximum(scores, w * kernel)
+        # For each anchor, compute Gaussian kernel and take max over anchors
+        feat_contrib = np.zeros(N)
+        for anchor in anchors:
+            dists_sq = np.sum((points - anchor) ** 2, axis=1)
+            kernel   = np.exp(-dists_sq / two_s2)
+            feat_contrib = np.maximum(feat_contrib, kernel)
+
+        # Take max across features so dense clusters don't double-count
+        scores = np.maximum(scores, w * feat_contrib)
 
     # Normalise: w_max = 1/(1+1) = 0.5 at obs=1, kernel=1 at dist=0
     # Scale so that a brand-new feature at dist=0 gives score=1.0
