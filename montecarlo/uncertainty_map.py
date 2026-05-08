@@ -1,17 +1,30 @@
 """
 montecarlo/uncertainty_map.py
 ------------------------------
-Orchestrates the full MC uncertainty map pipeline (Section III of paper):
+MC uncertainty map pipeline (Section III of paper).
 
-  1. Build virtual boundary features from current SLAM map
-  2. Sample N uniform points inside the bounding box (Eqs. 6-7)
-  3. Filter to navigable points (Section III-B)
-  4. Score each navigable point via sum-of-Gaussians (Eq. 10)
-  5. Return scored points for navigation and rendering
+Scoring model
+-------------
+Each MC point receives an uncertainty score in [0, 1]:
 
-Points scoring near 0.5 are "uncertain" — good navigation targets.
-Points near 0   are clearly free space.
-Points near 1   are clearly occupied (near a well-known feature).
+  score(p) = max over k of:  w_k * spatial_kernel(p, pos_k, sigma_k)
+
+where:
+  w_k    = exp(-obs_count_k / tau)
+    -- freshly seen feature (obs=1):  w ≈ exp(-1/tau) ≈ high
+    -- well-observed feature:         w ≈ 0             → suppressed
+  
+  spatial_kernel = exp(-dist(p, pos_k)^2 / (2 * sigma^2))
+    -- FIXED width sigma (not EKF covariance)
+    -- ensures a well-mapped wall still has a spatial footprint
+
+Taking the max rather than sum avoids double-counting when many
+features cluster near the same wall section.
+
+Score interpretation:
+  ~0   = open floor, well away from any feature (free space)
+  ~0.5 = near a freshly-seen / uncertain feature (explore here)
+  ~1   = right on top of a new feature (uncertain boundary)
 """
 
 from __future__ import annotations
@@ -22,22 +35,23 @@ from typing import Tuple, TYPE_CHECKING
 from montecarlo.virtual_features import build_virtual_features
 from montecarlo.sampler           import sample_points
 from montecarlo.navigability      import navigable_mask
-from montecarlo.probability       import score_points_vectorised, boundary_scores
 
 if TYPE_CHECKING:
     from slam.state import SLAMState
 
+
+# ---------------------------------------------------------------------------
+# UncertaintyMap result container
+# ---------------------------------------------------------------------------
 
 @dataclass
 class UncertaintyMap:
     """
     Result of one MC uncertainty map computation.
 
-    Attributes
-    ----------
     points   : (M, 2) navigable sample points
-    scores   : (M,)   uncertainty score in [0, 1] for each point
-    bounds   : (xmin, xmax, ymin, ymax) of the bounding box used
+    scores   : (M,)   uncertainty score in [0, 1]
+    bounds   : (xmin, xmax, ymin, ymax) sampling bounding box
     n_total  : total points sampled before navigability filter
     """
     points:  np.ndarray
@@ -47,17 +61,13 @@ class UncertaintyMap:
 
     @property
     def uncertain_mask(self) -> np.ndarray:
-        """Boolean mask: True for points in the uncertainty band [lo, hi]."""
         return self._band_mask
 
     def set_band(self, lo: float, hi: float) -> None:
         self._band_mask = (self.scores >= lo) & (self.scores <= hi)
-        self._lo = lo
-        self._hi = hi
 
     @property
     def uncertain_points(self) -> np.ndarray:
-        """Points scoring in the uncertainty band."""
         return self.points[self._band_mask]
 
     @property
@@ -65,14 +75,99 @@ class UncertaintyMap:
         return self.scores[self._band_mask]
 
 
-def build_uncertainty_map(state:        'SLAMState',
+# ---------------------------------------------------------------------------
+# Feature position helper
+# ---------------------------------------------------------------------------
+
+def _feature_xy(feat, state: 'SLAMState') -> np.ndarray:
+    """Return the XY world position of a feature."""
+    mean = state.feature_mean(feat.idx)
+    if feat.kind == 'corner':
+        return mean
+    # Line: use stored segment midpoint if available, else foot-of-perp
+    if feat.seg_p0 is not None and feat.seg_p1 is not None:
+        return 0.5 * (feat.seg_p0 + feat.seg_p1)
+    rho, alpha = mean
+    return np.array([rho * np.cos(alpha), rho * np.sin(alpha)])
+
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+def _score_uncertainty(points:       np.ndarray,
+                       state:         'SLAMState',
+                       spatial_sigma: float = 2.5,
+                       ) -> np.ndarray:
+    """
+    Score each point by proximity to freshly-seen (uncertain) features.
+
+    Parameters
+    ----------
+    points        : (N, 2)
+    state         : SLAMState
+    spatial_sigma : fixed spatial reach of each feature's influence (metres).
+                    Points within ~sigma metres of a new feature get high scores.
+                    Typical room width ~3m → sigma=1.5 covers half the corridor.
+    obs_tau       : decay constant for obs_count weighting.
+                    w = exp(-obs_count / tau).
+                    tau=8 → feature seen 8 times has w=exp(-1)≈0.37,
+                            feature seen 24 times has w=exp(-3)≈0.05.
+
+    Returns
+    -------
+    scores : (N,) in [0, 1].
+             High near features that haven't been well-observed yet.
+             Low in open space far from any feature, or near confident features.
+    """
+    N = len(points)
+    if N == 0 or state.n_features == 0:
+        return np.zeros(N)
+
+    scores = np.zeros(N)
+    two_s2 = 2.0 * spatial_sigma ** 2
+
+    for feat in state.features:
+        pos       = _feature_xy(feat, state)
+        obs_count = max(feat.obs_count, 1)
+
+        # Harmonic decay: w = 1 / (1 + obs_count)
+        #   obs=1  → w=0.50  (freshly seen, uncertain)
+        #   obs=5  → w=0.17  (a few observations)
+        #   obs=20 → w=0.05  (well-mapped, fading)
+        #   obs=60 → w=0.016 (fully mapped, nearly invisible)
+        w = 1.0 / (1.0 + obs_count)
+
+        if w < 0.01:
+            continue   # fully mapped, skip
+
+        # Fixed spatial Gaussian kernel — width independent of EKF covariance
+        dists_sq   = np.sum((points - pos) ** 2, axis=1)
+        kernel     = np.exp(-dists_sq / two_s2)
+
+        # Take max so dense feature clusters don't double-count
+        scores = np.maximum(scores, w * kernel)
+
+    # Normalise: w_max = 1/(1+1) = 0.5 at obs=1, kernel=1 at dist=0
+    # Scale so that a brand-new feature at dist=0 gives score=1.0
+    scores /= 0.5
+
+    np.clip(scores, 0.0, 1.0, out=scores)
+    return scores
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def build_uncertainty_map(state:           'SLAMState',
                            world,
-                           robot_pos:   np.ndarray,
-                           n_samples:   int   = 300,
-                           robot_radius: float = 0.25,
-                           virtual_cov: float  = 0.32,
-                           uncertainty_lo: float = 0.40,
-                           uncertainty_hi: float = 0.60,
+                           robot_pos:       np.ndarray,
+                           n_samples:       int   = 300,
+                           robot_radius:    float = 0.25,
+                           virtual_cov:     float = 0.32,
+                           uncertainty_lo:  float = 0.25,
+                           uncertainty_hi:  float = 0.75,
                            rng: np.random.Generator | None = None
                            ) -> UncertaintyMap:
     """
@@ -84,31 +179,25 @@ def build_uncertainty_map(state:        'SLAMState',
     world          : env.World (for navigability ray-casting)
     robot_pos      : (2,) current robot position
     n_samples      : number of MC points to draw
-    robot_radius   : robot radius for virtual feature offset
-    virtual_cov    : diagonal covariance for virtual boundary lines
-    uncertainty_lo : lower threshold for "uncertain" band
-    uncertainty_hi : upper threshold for "uncertain" band
+    robot_radius   : for bounding box expansion
+    uncertainty_lo : lower threshold for the uncertain band
+    uncertainty_hi : upper threshold for the uncertain band
     rng            : numpy Generator
-
-    Returns
-    -------
-    UncertaintyMap
     """
     if rng is None:
         rng = np.random.default_rng()
 
-    # 1. Virtual features + bounding box
-    virtual_lines, bounds = build_virtual_features(
+    # Bounding box from current map extents
+    _, bounds = build_virtual_features(
         state, robot_radius=robot_radius, virtual_cov=virtual_cov)
 
-    # 2. Sample
+    # Sample uniform points
     candidates = sample_points(bounds, n_samples, rng=rng)
 
-    # 3. Navigability filter
-    nav = navigable_mask(candidates, robot_pos, world)
+    # Navigability filter
+    nav           = navigable_mask(candidates, robot_pos, world)
     navigable_pts = candidates[nav]
 
-    # 4. Score
     if len(navigable_pts) == 0:
         result = UncertaintyMap(
             points  = np.empty((0, 2)),
@@ -119,19 +208,7 @@ def build_uncertainty_map(state:        'SLAMState',
         result.set_band(uncertainty_lo, uncertainty_hi)
         return result
 
-    # Real-feature Gaussian scores (corners + lines)
-    feature_scores = score_points_vectorised(navigable_pts, state, virtual_lines)
-
-    # Boundary proximity score: 0.5 at walls, decaying inward.
-    # This implements the paper's intent that unexplored frontiers
-    # near the map boundary score near 0.5 regardless of room size.
-    b_scores = boundary_scores(navigable_pts, bounds)
-
-    # Combine: boundary term provides a 0.5 baseline near walls; real
-    # features pull well-mapped regions toward 0 (free) or >0.5 (occupied).
-    # Take the maximum so known-feature regions still dominate.
-    scores = np.maximum(feature_scores, b_scores)
-    np.clip(scores, 0.0, 1.0, out=scores)
+    scores = _score_uncertainty(navigable_pts, state)
 
     result = UncertaintyMap(
         points  = navigable_pts,

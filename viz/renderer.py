@@ -372,19 +372,19 @@ class Renderer:
                 mlines.Line2D([], [], color='#0f2a47', marker='o',
                               linestyle='none', markersize=7,
                               markerfacecolor='#0f2a47',
-                              label='Free space (well mapped)'),
+                              label='Well mapped / open space'),
                 mlines.Line2D([], [], color='#1e6b8a', marker='o',
                               linestyle='none', markersize=7,
                               markerfacecolor='#1e6b8a',
-                              label='Partially explored'),
+                              label='Near a confident feature'),
                 mlines.Line2D([], [], color='#f59e0b', marker='o',
                               linestyle='none', markersize=9,
                               markerfacecolor='#f59e0b',
-                              label='Uncertain frontier ← nav target'),
+                              label='Near a freshly-seen feature ← uncertain'),
                 mlines.Line2D([], [], color='#c2410c', marker='o',
                               linestyle='none', markersize=7,
                               markerfacecolor='#c2410c',
-                              label='Near mapped feature'),
+                              label='Right on top of a new feature'),
             ]
 
         # ── key bindings in title ─────────────────────────────────────────
