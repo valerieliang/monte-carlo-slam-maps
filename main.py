@@ -72,6 +72,7 @@ from viz.heatmap       import HeatmapRenderer
 from viz.logger        import PathLogger
 from montecarlo.uncertainty_map import build_uncertainty_map
 from navigation.selector        import GoalSelector
+from navigation.slam_world      import SLAMWorld
 from navigation.controller      import Controller, Mode
 
 
@@ -234,6 +235,27 @@ def _draw_goal_ring(ax, goal: np.ndarray, artists: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Combined world: queries both ground-truth and SLAM map for collision checks
+
+class _CombinedWorld:
+    """
+    Wraps ground-truth world + SLAM-derived walls for controller ray-casting.
+    Returns the closest hit from either source so the robot respects both
+    the true geometry AND walls it has explicitly mapped.
+    """
+    def __init__(self, gt_world, slam_world):
+        self._gt   = gt_world
+        self._slam = slam_world
+
+    def ray_intersect(self, origin, angle, max_range=30.0):
+        r1 = self._gt.ray_intersect(origin, angle, max_range)
+        r2 = self._slam.ray_intersect(origin, angle, max_range)
+        if r1 is None:   return r2
+        if r2 is None:   return r1
+        return r1 if r1[0] <= r2[0] else r2
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -279,6 +301,7 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
     mc_every           = max(1, round(1.0 / cfg.sim.dt))
     mc_counter         = 0
     last_umap          = None
+    umap_is_fresh      = False   # True only the step MC just ran
     heatmap_force_draw = False
 
     # Path logger
@@ -357,6 +380,7 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
             nav_goal_art = _clear_artists(nav_goal_art)
             returning    = False
             last_umap    = None
+            umap_is_fresh = False
             mc_counter   = 0
             keys.reset   = False
             path_log.reset()
@@ -383,6 +407,7 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
             heatmap            = HeatmapRenderer(renderer.ax)
             heatmap_force_draw = False
             last_umap          = None
+            umap_is_fresh      = False
             nav_goal_art       = []
             returning          = False
             mc_counter         = 0
@@ -409,7 +434,8 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
         if keys.clicked_goal is not None:
             goal = keys.clicked_goal
             keys.clicked_goal = None
-            controller.set_goal(goal)
+            controller._current_pos = robot.pos.copy()
+            controller.set_goal(goal, world=_slam_world)
             # Interrupt any autonomous return-to-start
             returning    = False
             nav_goal_art = _draw_goal_ring(renderer.ax, goal, nav_goal_art)
@@ -417,8 +443,11 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
 
         # -- Physics ----------------------------------------------------------
 
+        # Build worlds for controller use each step
+        _slam_world = SLAMWorld.from_state(slam_state)  # robot's known map
+        _cw = _CombinedWorld(world, _slam_world)        # gt+slam for proximity
         if auto:
-            v, omega = controller.step(slam_state.pose, world, dt)
+            v, omega = controller.step(slam_state.pose, _cw, dt, slam_world=_slam_world)
         else:
             v, omega = keys.compute_command(cfg.robot.max_v, cfg.robot.max_omega)
 
@@ -470,6 +499,7 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
                 uncertainty_hi = cfg.montecarlo.uncertainty_hi,
                 rng            = mc_rng,
             )
+            umap_is_fresh = True
             if show_heatmap:
                 heatmap.update(last_umap)
                 heatmap_force_draw = False
@@ -481,22 +511,27 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
                 controller.set_goal(start_pos)
                 if controller.goal_reached(robot.pos):
                     controller.set_goal(None)
-                    returning    = False
-                    nav_goal_art = _clear_artists(nav_goal_art)
+                    returning     = False
+                    umap_is_fresh = False   # force fresh MC before next goal
+                    nav_goal_art  = _clear_artists(nav_goal_art)
                     print("[auto] Returned to start.  Exploration complete.")
             elif controller.goal_reached(robot.pos):
                 selector.notify_goal_reached(robot.pos)
-                nav_goal_art = _clear_artists(nav_goal_art)
+                nav_goal_art  = _clear_artists(nav_goal_art)
                 controller.set_goal(None)
+                umap_is_fresh = False   # wait for fresh MC before picking next goal
 
-            if not returning and controller.goal is None:
+            # Only pick a new goal when we have a fresh uncertainty map.
+            # This prevents re-querying the same stale 'complete' map every step.
+            if not returning and controller.goal is None and umap_is_fresh:
+                umap_is_fresh = False
                 result = selector.select(last_umap, robot.pos)
                 if result.source == 'complete':
                     print("[auto] Map complete - returning to start.")
                     returning = True
-                    controller.set_goal(start_pos)
+                    controller.set_goal(start_pos, world=_slam_world)
                 else:
-                    controller.set_goal(result.goal)
+                    controller.set_goal(result.goal, world=_slam_world)
                     nav_goal_art = _draw_goal_ring(
                         renderer.ax, result.goal, nav_goal_art)
                     print(f"[auto] Goal ({result.source}): "
