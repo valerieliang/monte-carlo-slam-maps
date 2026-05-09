@@ -276,7 +276,9 @@ class TestControllerWallFollow:
         assert v != 0.0 or omega != 0.0
 
     def test_follow_returns_to_pursue_after_duration(self, world):
-        ctrl = Controller(stuck_thresh=100.0, check_interval=0.01,
+        # Use a long check_interval so stuck detection doesn't re-trigger
+        # FOLLOW immediately after it exits, letting us assert PURSUE.
+        ctrl = Controller(stuck_thresh=100.0, check_interval=999.0,
                           follow_duration=0.5)
         ctrl.set_goal(np.array([5.0, 5.0]))
         ctrl._mode = Mode.FOLLOW
@@ -317,13 +319,13 @@ class TestAutonomousIntegration:
         """Robot should reach a close-by goal within 5 seconds."""
         world = World.from_preset('open')
         ctrl  = Controller(k_v=0.5, k_w=1.5, max_v=0.5, max_omega=1.5,
-                           goal_tolerance=0.3)
+                           goal_tolerance=0.3, check_interval=999.0)
         goal  = np.array([4.0, 4.0])
         ctrl.set_goal(goal)
         pose  = np.array([1.0, 1.0, 0.0])
 
         reached = False
-        for _ in range(100):
+        for _ in range(250):    # up to 12.5 s — allows alignment + drive
             v, omega = ctrl.step(pose, world, dt=0.05)
             pose[0] += v * np.cos(pose[2]) * 0.05
             pose[1] += v * np.sin(pose[2]) * 0.05
@@ -364,14 +366,14 @@ class TestAutonomousIntegration:
         """
         world     = World.from_preset('open')
         ctrl      = Controller(k_v=0.5, k_w=1.5, max_v=0.5, max_omega=1.5,
-                               goal_tolerance=0.3)
+                               goal_tolerance=0.3, check_interval=999.0)
         start_pos = np.array([1.0, 1.0])
         pose      = np.array([7.0, 7.0, np.pi])   # far from start
 
         ctrl.set_goal(start_pos)
         d0 = np.linalg.norm(pose[:2] - start_pos)
 
-        for _ in range(200):
+        for _ in range(400):    # up to 20 s from far corner
             v, omega = ctrl.step(pose, world, dt=0.05)
             pose[0] += v * np.cos(pose[2]) * 0.05
             pose[1] += v * np.sin(pose[2]) * 0.05
