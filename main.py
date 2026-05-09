@@ -7,7 +7,8 @@ Phase 1: static world + manual keyboard drive.
 Phase 2: live laser scan overlay.
 Phase 3: synthetic feature extraction overlay.
 Phase 4: EKF-SLAM predict + update + covariance ellipses
-Phase 5: Monte Carlo uncertainty heatmap  (ACTIVE)
+Phase 5: Monte Carlo uncertainty heatmap
+Phase 6: Autonomous navigation  (ACTIVE when --auto)
 
 Controls
 --------
@@ -19,11 +20,13 @@ Controls
   M         : toggle SLAM map overlay on/off
   U         : toggle MC uncertainty heatmap on/off
   H         : print help
+  (manual drive disabled in --auto mode)
 
 Run
 ---
-  python main.py
-  python main.py --world corridor
+  python main.py                     # manual drive
+  python main.py --auto              # autonomous exploration
+  python main.py --auto --world corridor
 """
 
 from __future__ import annotations
@@ -47,6 +50,8 @@ from viz.renderer      import Renderer
 from viz.covariance    import draw_slam_features
 from viz.heatmap       import HeatmapRenderer
 from montecarlo.uncertainty_map import build_uncertainty_map
+from navigation.selector        import GoalSelector
+from navigation.controller      import Controller, Mode
 
 
 # ----------------------------------------------------------------- key state
@@ -93,23 +98,35 @@ class KeyState:
 
 # ---------------------------------------------------------------- sim factory
 
-def build_sim(cfg: Config, preset: str | None = None):
+def build_sim(cfg: Config, preset: str | None = None, auto: bool = False):
     p         = preset or cfg.world.preset
     world     = World.from_preset(p)
     robot     = Robot(cfg.robot.start_x, cfg.robot.start_y,
                       cfg.robot.start_theta, cfg.robot.radius)
     sensor    = Sensor.from_cfg(cfg.sensor)
     extractor = FeatureExtractor.from_cfg(cfg)
+    phase     = "6 — Autonomous" if auto else "5"
     renderer  = Renderer(world,
                          figsize=tuple(cfg.renderer.figsize),
                          dpi=cfg.renderer.dpi,
-                         title=f'Active SLAM — Phase 4  [{p}]')
-    # EKF-SLAM state: start with zero initial pose covariance (known start)
+                         title=f'Active SLAM — Phase {phase}  [{p}]')
     slam_state = SLAMState(
         init_pose     = robot.pose,
         init_pose_cov = np.zeros((3, 3)),
     )
-    return world, robot, sensor, extractor, renderer, slam_state
+    selector   = GoalSelector(
+        local_area_size = cfg.montecarlo.local_area_size,
+        min_dist        = 1.0,
+        dedup_dist      = cfg.navigation.duplicate_thresh,
+    )
+    controller = Controller(
+        k_v            = cfg.navigation.controller_k_v,
+        k_w            = cfg.navigation.controller_k_w,
+        max_v          = cfg.robot.max_v,
+        max_omega      = cfg.robot.max_omega,
+        goal_tolerance = cfg.navigation.goal_tolerance,
+    )
+    return world, robot, sensor, extractor, renderer, slam_state, selector, controller
 
 
 def _build_R(cfg) -> tuple:
@@ -120,14 +137,14 @@ def _build_R(cfg) -> tuple:
 
 # ----------------------------------------------------------------- main loop
 
-def run(cfg: Config, preset: str | None = None) -> None:
-    world, robot, sensor, extractor, renderer, slam_state = build_sim(cfg, preset)
+def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
+    world, robot, sensor, extractor, renderer, slam_state, selector, controller =         build_sim(cfg, preset, auto=auto)
     renderer.init()
 
     keys            = KeyState()
     show_features   = True
     show_slam       = True
-    show_heatmap    = False   # U to toggle on
+    show_heatmap    = auto    # on by default in auto mode
 
     renderer.fig.canvas.mpl_connect('key_press_event',   keys.on_press)
     renderer.fig.canvas.mpl_connect('key_release_event', keys.on_release)
@@ -147,12 +164,25 @@ def run(cfg: Config, preset: str | None = None) -> None:
     # SLAM feature artists (re-drawn each frame on the axes)
     slam_artists  = []
 
-    # Phase 5 — heatmap renderer and MC update cadence
+    # Heatmap + MC update cadence
     heatmap       = HeatmapRenderer(renderer.ax)
     mc_rng        = np.random.default_rng()
-    mc_every      = max(1, int(1.0 / (cfg.sim.dt * cfg.sim.render_fps)))  # every ~1 s
+    mc_every      = max(1, int(1.0 / (cfg.sim.dt * cfg.sim.render_fps)))
     mc_counter    = 0
-    print("[main] Phase 5 running.  U toggles MC heatmap.  M = SLAM.  Q = quit.")
+    last_umap     = None      # most recent uncertainty map for nav
+
+    # Phase 6 — autonomous state
+    start_pos     = robot.pos.copy()
+    returning     = False     # True when heading back to start
+    nav_goal_art  = []        # goal ring artist list
+
+    if auto:
+        renderer.update_legend(show_heatmap=True, show_features=show_features,
+                               show_slam=show_slam,
+                                   show_auto=auto)
+        print("[main] Phase 6 — autonomous.  U=heatmap  M=SLAM  Q=quit.")
+    else:
+        print("[main] Manual drive.  U=heatmap  M=SLAM  Q=quit.")
 
     while plt.fignum_exists(renderer.fig.number):
         t0 = time.perf_counter()
@@ -166,7 +196,8 @@ def run(cfg: Config, preset: str | None = None) -> None:
             keys.toggle_features = False
             renderer.update_legend(show_heatmap=show_heatmap,
                                    show_features=show_features,
-                                   show_slam=show_slam)
+                                   show_slam=show_slam,
+                                   show_auto=auto)
             print(f"[main] Feature overlay {'ON' if show_features else 'OFF'}")
 
         if keys.toggle_slam:
@@ -174,7 +205,8 @@ def run(cfg: Config, preset: str | None = None) -> None:
             keys.toggle_slam = False
             renderer.update_legend(show_heatmap=show_heatmap,
                                    show_features=show_features,
-                                   show_slam=show_slam)
+                                   show_slam=show_slam,
+                                   show_auto=auto)
             print(f"[main] SLAM map {'ON' if show_slam else 'OFF'}")
 
         if keys.toggle_heatmap:
@@ -184,7 +216,8 @@ def run(cfg: Config, preset: str | None = None) -> None:
                 heatmap.clear()
             renderer.update_legend(show_heatmap=show_heatmap,
                                    show_features=show_features,
-                                   show_slam=show_slam)
+                                   show_slam=show_slam,
+                                   show_auto=auto)
             print(f"[main] MC heatmap {'ON' if show_heatmap else 'OFF'}")
 
         if keys.reset:
@@ -193,14 +226,19 @@ def run(cfg: Config, preset: str | None = None) -> None:
             slam_state = SLAMState(init_pose=robot.pose,
                                    init_pose_cov=np.zeros((3, 3)))
             heatmap.clear()
+            selector.reset()
+            controller.set_goal(None)
+            nav_goal_art = _clear_artists(nav_goal_art)
+            returning    = False
+            last_umap    = None
             mc_counter   = 0
             keys.reset   = False
             print("[main] Robot + SLAM state reset.")
 
         if keys.preset is not None:
             renderer.close()
-            world, robot, sensor, extractor, renderer, slam_state = \
-                build_sim(cfg, keys.preset)
+            world, robot, sensor, extractor, renderer, slam_state, selector, controller = \
+                build_sim(cfg, keys.preset, auto=auto)
             renderer.init()
             renderer.fig.canvas.mpl_connect('key_press_event',   keys.on_press)
             renderer.fig.canvas.mpl_connect('key_release_event', keys.on_release)
@@ -209,17 +247,27 @@ def run(cfg: Config, preset: str | None = None) -> None:
             keys._held.clear()
             slam_artists  = []
             heatmap       = HeatmapRenderer(renderer.ax)
+            selector.reset()
+            controller.set_goal(None)
+            nav_goal_art  = []
+            returning     = False
+            last_umap     = None
             mc_counter    = 0
             show_features = True
             show_slam     = True
-            show_heatmap  = False
-            renderer.update_legend(show_heatmap=False,
+            show_heatmap  = auto
+            renderer.update_legend(show_heatmap=auto,
                                    show_features=True,
-                                   show_slam=True)
+                                   show_slam=True,
+                                   show_auto=auto)
             continue
 
         # -- physics + sensing -----------------------------------------------
-        v, omega = keys.compute_command(cfg.robot.max_v, cfg.robot.max_omega)
+        if auto:
+            v, omega = controller.step(slam_state.pose, world, dt)
+        else:
+            v, omega = keys.compute_command(cfg.robot.max_v, cfg.robot.max_omega)
+
         robot.step(v, omega, dt)
 
         # -- EKF predict ------------------------------------------------------
@@ -250,11 +298,14 @@ def run(cfg: Config, preset: str | None = None) -> None:
                 # update existing
                 update_single(slam_state, feat_idx, obs.z, R)
 
-        # -- MC uncertainty map (every ~1 s when heatmap visible) -----------
+        # -- MC uncertainty map ---------------------------------------------------
+        # Run every ~1 s in auto mode (always), or only when heatmap visible.
         mc_counter += 1
-        if show_heatmap and slam_state.n_features > 0 and mc_counter >= mc_every:
+        run_mc = (slam_state.n_features > 0 and mc_counter >= mc_every and
+                  (auto or show_heatmap))
+        if run_mc:
             mc_counter = 0
-            umap = build_uncertainty_map(
+            last_umap  = build_uncertainty_map(
                 state          = slam_state,
                 world          = world,
                 robot_pos      = robot.pos,
@@ -265,7 +316,36 @@ def run(cfg: Config, preset: str | None = None) -> None:
                 uncertainty_hi = cfg.montecarlo.uncertainty_hi,
                 rng            = mc_rng,
             )
-            heatmap.update(umap)
+            if show_heatmap:
+                heatmap.update(last_umap)
+
+        # -- Autonomous navigation --------------------------------------------
+        if auto and last_umap is not None:
+            if returning:
+                # Heading back to start
+                controller.set_goal(start_pos)
+                if controller.goal_reached(robot.pos):
+                    controller.set_goal(None)
+                    returning = False
+                    print("[auto] Returned to start. Exploration complete.")
+            elif controller.goal_reached(robot.pos):
+                selector.notify_goal_reached(robot.pos)
+                nav_goal_art = _clear_artists(nav_goal_art)
+                controller.set_goal(None)
+
+            if not returning and controller.goal is None:
+                result = selector.select(last_umap, robot.pos)
+                if result.source == 'complete':
+                    print("[auto] Map complete — returning to start.")
+                    returning = True
+                    controller.set_goal(start_pos)
+                else:
+                    controller.set_goal(result.goal)
+                    nav_goal_art = _draw_goal_ring(
+                        renderer.ax, result.goal, nav_goal_art)
+                    print(f"[auto] New goal ({result.source}): "
+                          f"({result.goal[0]:.1f}, {result.goal[1]:.1f})  "
+                          f"uncertain={result.n_uncertain}")
 
 
         # -- render at target FPS --------------------------------------------
@@ -389,6 +469,32 @@ def _draw_slam(ax, state: SLAMState) -> list:
 
 
 
+# ------------------------------------------------------------ nav goal drawing
+
+def _clear_artists(artists: list) -> list:
+    for a in artists:
+        try:
+            a.remove()
+        except Exception:
+            pass
+    return []
+
+
+def _draw_goal_ring(ax, goal: np.ndarray, artists: list) -> list:
+    """Draw the navigation goal ring and clear the previous one."""
+    artists = _clear_artists(artists)
+    if goal is None:
+        return []
+    ring, = ax.plot(goal[0], goal[1], 'o',
+                    color='#f59e0b', markersize=18,
+                    markerfacecolor='none', markeredgewidth=2.5,
+                    zorder=15)
+    dot,  = ax.plot(goal[0], goal[1], 'o',
+                    color='#f59e0b', markersize=5,
+                    zorder=16)
+    return [ring, dot]
+
+
 # ---------------------------------------------------------------------- CLI
 
 def parse_args():
@@ -396,10 +502,12 @@ def parse_args():
     p.add_argument('--world',  choices=['lab', 'corridor', 'open'],
                    default=None)
     p.add_argument('--config', default='config.yaml')
+    p.add_argument('--auto',   action='store_true',
+                   help='Enable autonomous exploration (Phase 6)')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
     cfg  = Config.load(args.config)
-    run(cfg, preset=args.world)
+    run(cfg, preset=args.world, auto=args.auto)
