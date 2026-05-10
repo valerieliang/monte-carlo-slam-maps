@@ -364,10 +364,17 @@ def run_simulation(cfg: Config,
     mc_rng      = np.random.default_rng(seed + 1)
     mc_every    = max(1, round(1.0 / cfg.sim.dt))
     mc_counter  = 0
+    mc_cycles   = 0        # total MC runs completed
     last_umap   = None
     umap_fresh  = False
     returning   = False
     start_pos   = robot.pos.copy()
+    # Guard: don't allow 'complete' until the robot has driven at least
+    # MIN_EXPLORE_DIST metres AND completed at least MIN_MC_CYCLES MC runs.
+    # This prevents a false-complete when all features happen to be visible
+    # from the start position and the first MC scores everything as low-uncertainty.
+    MIN_EXPLORE_DIST = 3.0   # metres
+    MIN_MC_CYCLES    = 5     # MC updates before completion is allowed
     prev_pos: np.ndarray | None = None
     t           = 0.0
     dt          = cfg.sim.dt
@@ -458,6 +465,7 @@ def run_simulation(cfg: Config,
                 rng            = mc_rng,
             )
             umap_fresh = True
+            mc_cycles += 1
 
         # -- Autonomous navigation -------------------------------------------
         if last_umap is not None:
@@ -474,12 +482,32 @@ def run_simulation(cfg: Config,
 
             if not returning and controller.goal is None and umap_fresh:
                 umap_fresh = False
+                # Don't declare complete too early: robot must have moved
+                # and the uncertainty map must have been refreshed enough
+                # times to have actually explored, not just seen from start.
+                explored_enough = (recorder.path_length >= MIN_EXPLORE_DIST
+                                   and mc_cycles >= MIN_MC_CYCLES)
                 result = selector.select(last_umap, robot.pos)
-                if result.source == 'complete':
+                if result.source == 'complete' and explored_enough:
                     print(f"[analytics] Map declared complete at t={t:.1f}s "
-                          f"step={step}. Returning to start.")
+                          f"step={step}  path={recorder.path_length:.1f}m. "
+                          f"Returning to start.")
                     returning = True
                     controller.set_goal(start_pos, world=_slam_world)
+                elif result.source == 'complete' and not explored_enough:
+                    # Too early — nudge the robot by issuing a random
+                    # frontier goal toward the room centre so it starts moving.
+                    bounds = world.bounds
+                    cx = (bounds[0] + bounds[1]) / 2
+                    cy = (bounds[2] + bounds[3]) / 2
+                    nudge = np.array([cx, cy]) + np.array([
+                        np.random.uniform(-2, 2),
+                        np.random.uniform(-2, 2)])
+                    controller.set_goal(nudge, world=_slam_world)
+                    print(f"[analytics] Early complete suppressed "
+                          f"(path={recorder.path_length:.1f}m < {MIN_EXPLORE_DIST}m "
+                          f"or mc_cycles={mc_cycles} < {MIN_MC_CYCLES}). "
+                          f"Nudging to ({nudge[0]:.1f},{nudge[1]:.1f}).")
                 else:
                     controller.set_goal(result.goal, world=_slam_world)
                     recorder.goal_positions.append(result.goal.copy())
@@ -839,9 +867,9 @@ def build_report(rec: SimRecorder,
     dy    = 0.95 / len(summary_data)
     for label, value in summary_data:
         if label.startswith('─'):
-            ax11.axhline(row_y, xmin=0.01, xmax=0.99,
-                         color=STYLE['grid'], linewidth=0.5,
-                         transform=ax11.transAxes)
+            ax11.plot([0.01, 0.99], [row_y, row_y],
+                      color=STYLE['grid'], linewidth=0.5,
+                      transform=ax11.transAxes, clip_on=False)
         else:
             bold = value == '' or label.startswith('  ') is False
             weight = 'bold' if (value == '' and not label.startswith('  ')) else 'normal'
