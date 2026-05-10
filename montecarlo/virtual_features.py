@@ -70,60 +70,51 @@ def build_virtual_features(state: SLAMState,
     else:
         xmin, xmax, ymin, ymax = _map_extents(state)
 
-    # Expand by robot_radius on each side (paper: virtual line offset = robot radius)
-    xmin -= robot_radius
-    xmax += robot_radius
-    ymin -= robot_radius
-    ymax += robot_radius
-
     cov = np.diag([virtual_cov, virtual_cov])
 
-    # Four axis-aligned boundary lines, normals pointing inward
-    # South wall:  y = ymin,  normal points up   (alpha = pi/2)
-    # North wall:  y = ymax,  normal points down  (alpha = -pi/2, rho = -ymax → normalise)
-    # West  wall:  x = xmin,  normal points right (alpha = 0)
-    # East  wall:  x = xmax,  normal points left  (alpha = pi, rho = -xmax → normalise)
+    # The four virtual lines sit AT the map boundary (at the outermost features).
+    # The paper's robot_radius offset is used to ensure the virtual line is not
+    # closer than robot_radius to any physical wall — here we simply use the
+    # extents of the current feature map directly.
+    #
+    # Polar form: for a horizontal line at y=c, rho=c, alpha=pi/2
+    #             for a vertical   line at x=c, rho=c, alpha=0
+    # All rho values must be ≥ 0; if a boundary is at a negative coordinate,
+    # we flip the normal (alpha += pi) and take rho = abs.
+    #
+    # Segment endpoints span the full bounding box in the tangential direction
+    # so that ANY interior point falls within at least one line's region.
+
+    def _make_hline(y_val, x0, x1):
+        """Horizontal virtual line at y=y_val."""
+        rho   = abs(y_val)
+        alpha = np.pi / 2 if y_val >= 0 else -np.pi / 2
+        return VirtualLine(rho=rho, alpha=alpha, cov=cov.copy(),
+                           seg_p0=np.array([x0, y_val]),
+                           seg_p1=np.array([x1, y_val]))
+
+    def _make_vline(x_val, y0, y1):
+        """Vertical virtual line at x=x_val."""
+        rho   = abs(x_val)
+        alpha = 0.0 if x_val >= 0 else np.pi
+        return VirtualLine(rho=rho, alpha=alpha, cov=cov.copy(),
+                           seg_p0=np.array([x_val, y0]),
+                           seg_p1=np.array([x_val, y1]))
 
     virtual_lines = [
-        # South: rho = ymin (measured along y), alpha = pi/2
-        VirtualLine(
-            rho    = ymin,
-            alpha  = np.pi / 2,
-            cov    = cov.copy(),
-            seg_p0 = np.array([xmin, ymin]),
-            seg_p1 = np.array([xmax, ymin]),
-        ),
-        # North: rho = ymax, alpha = -pi/2 → normalise: rho = ymax, alpha = pi/2 flipped
-        # Use rho = ymax, alpha = np.pi/2 with sign flip convention:
-        # rho >= 0 convention: rho = ymax, alpha = pi/2 (same as south but positive rho)
-        # The north wall normal points in -y direction from outside → alpha = -pi/2
-        # but rho must be positive: rho = ymax, alpha = pi/2 works when ymax > 0
-        VirtualLine(
-            rho    = ymax,
-            alpha  = np.pi / 2,
-            cov    = cov.copy(),
-            seg_p0 = np.array([xmin, ymax]),
-            seg_p1 = np.array([xmax, ymax]),
-        ),
-        # West: rho = xmin, alpha = 0
-        VirtualLine(
-            rho    = xmin,
-            alpha  = 0.0,
-            cov    = cov.copy(),
-            seg_p0 = np.array([xmin, ymin]),
-            seg_p1 = np.array([xmin, ymax]),
-        ),
-        # East: rho = xmax, alpha = 0
-        VirtualLine(
-            rho    = xmax,
-            alpha  = 0.0,
-            cov    = cov.copy(),
-            seg_p0 = np.array([xmax, ymin]),
-            seg_p1 = np.array([xmax, ymax]),
-        ),
+        _make_hline(ymin, xmin, xmax),   # south
+        _make_hline(ymax, xmin, xmax),   # north
+        _make_vline(xmin, ymin, ymax),   # west
+        _make_vline(xmax, ymin, ymax),   # east
     ]
 
-    return virtual_lines, (xmin, xmax, ymin, ymax)
+    # Sampling bounds: shrink inward by robot_radius so samples stay off walls
+    sx_min = xmin + robot_radius
+    sx_max = xmax - robot_radius
+    sy_min = ymin + robot_radius
+    sy_max = ymax - robot_radius
+
+    return virtual_lines, (sx_min, sx_max, sy_min, sy_max)
 
 
 def _map_extents(state: SLAMState) -> Tuple[float, float, float, float]:

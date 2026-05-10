@@ -13,7 +13,7 @@ robot:
   start_y:     1.0      # initial y  (metres)
   start_theta: 0.0      # initial heading (radians)
   radius:      0.25     # physical radius (m) -- matches paper
-  max_v:       0.5      # max linear velocity  (m/s)
+  max_v:       1.0      # max linear velocity  (m/s)
   max_omega:   1.0      # max angular velocity (rad/s)
 
 # -- Simulation ---------------------------------------------------------------
@@ -48,7 +48,7 @@ ekf:
 
 # -- Monte Carlo (Phase 5) ----------------------------------------------------
 montecarlo:
-  n_samples_local:  300   # MC points for local  uncertainty search
+  n_samples_local:  150   # MC points for local  uncertainty search
   n_samples_global: 800   # MC points for global uncertainty search
   local_area_size:  5.0   # side length of local search square (m)
   uncertainty_lo:   0.40  # lower probability threshold for 'uncertain'
@@ -65,4 +65,4 @@ navigation:
 # -- Renderer -----------------------------------------------------------------
 renderer:
   figsize: [10, 7]
-  dpi:     110
+  dpi:     80

@@ -48,8 +48,8 @@ class HeatmapRenderer:
     """
 
     def __init__(self, ax: plt.Axes,
-                 base_size:  float = 8.0,
-                 band_size:  float = 18.0,
+                 base_size:  float = 14.0,
+                 band_size:  float = 28.0,
                  base_alpha: float = 0.55,
                  band_alpha: float = 0.85,
                  zorder:     int   = 5):
@@ -75,29 +75,37 @@ class HeatmapRenderer:
         if len(pts) == 0:
             return
 
-        # All navigable points — small, semi-transparent
+        # Normalise to actual score range so colours span the full gradient
+        # even when most scores are low (early in exploration).
+        s_min = float(scores.min())
+        s_max = float(scores.max())
+        if s_max - s_min < 1e-6:
+            s_max = s_min + 1e-6
+        norm = mcolors.Normalize(vmin=s_min, vmax=s_max)
+
+        # All navigable points
         self._scatter_all = self._ax.scatter(
             pts[:, 0], pts[:, 1],
-            c       = scores,
-            cmap    = _CMAP,
-            norm    = self._norm,
-            s       = self._base_size,
-            alpha   = self._base_alpha,
-            zorder  = self._zorder,
+            c          = scores,
+            cmap       = _CMAP,
+            norm       = norm,
+            s          = self._base_size,
+            alpha      = self._base_alpha,
+            zorder     = self._zorder,
             linewidths = 0,
         )
 
-        # Uncertain band — larger, more opaque, stand out as nav targets
+        # Uncertain band — larger markers so navigation targets stand out
         band = umap.uncertain_mask
         if band.any():
             self._scatter_band = self._ax.scatter(
                 pts[band, 0], pts[band, 1],
-                c       = scores[band],
-                cmap    = _CMAP,
-                norm    = self._norm,
-                s       = self._band_size,
-                alpha   = self._band_alpha,
-                zorder  = self._zorder + 1,
+                c          = scores[band],
+                cmap       = _CMAP,
+                norm       = norm,
+                s          = self._band_size,
+                alpha      = self._band_alpha,
+                zorder     = self._zorder + 1,
                 linewidths = 0,
             )
 

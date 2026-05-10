@@ -506,13 +506,13 @@ class FeatureExtractor:
             seg_normal = ref_seg.normal
             seg_dir    = ref_seg.direction
 
-            # 1. Facing-side check: robot must be on the outward-normal side
-            if np.dot(origin - ref_seg.p0, seg_normal) <= 0:
-                continue
-
-            # 2. Noiseless measurement — reject if rho_obs < 0
+            # 1. Compute noiseless measurement; positive rho_obs means
+            #    the robot is on the observable side of this wall.
+            #    This replaces the normal-dot check which fails for walls
+            #    whose segment direction convention places the normal on the
+            #    wrong side (e.g. branch corridor interior walls).
             z_clean = h_line(robot_pose, rho, alpha)
-            if z_clean[0] < 0:
+            if z_clean[0] <= 0:
                 continue
 
             # 3. Range gate: closest point on any segment in group
