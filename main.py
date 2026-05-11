@@ -21,6 +21,9 @@ Run
   python main.py                     # manual drive
   python main.py --auto              # autonomous exploration
   python main.py --auto --world corridor
+  python main.py --auto --record                    # record to recording.mp4
+  python main.py --auto --record run1.mp4           # record to run1.mp4
+  python main.py --auto --record run1.mp4 --record-fps 30
 """
 
 from __future__ import annotations
@@ -55,6 +58,7 @@ _chosen_backend = _pick_backend()
 import argparse, time
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.animation import FFMpegWriter, PillowWriter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -259,7 +263,8 @@ class _CombinedWorld:
 # Main loop
 # ---------------------------------------------------------------------------
 
-def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
+def run(cfg: Config, preset: str | None = None, auto: bool = False,
+        record: str | None = None, record_fps: int | None = None) -> None:
 
     world, robot, sensor, extractor, renderer, slam_state, selector, controller = \
         build_sim(cfg, preset, auto=auto)
@@ -295,23 +300,37 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
     # Heatmap
     heatmap            = HeatmapRenderer(renderer.ax)
     mc_rng             = np.random.default_rng()
-    # Run MC once per simulated second: round(1s / dt) steps.
-    # The old formula divided by render_fps too, giving mc_every=1
-    # when dt=0.05 and fps=20, which ran MC every single step.
     mc_every           = max(1, round(1.0 / cfg.sim.dt))
     mc_counter         = 0
     last_umap          = None
-    umap_is_fresh      = False   # True only the step MC just ran
+    umap_is_fresh      = False
     heatmap_force_draw = False
 
     # Path logger
     path_log         = PathLogger(world)
-    path_log_artists = False   # True once overlay drawn
+    path_log_artists = False
 
     # Phase 6 state
     start_pos    = robot.pos.copy()
     returning    = False
     nav_goal_art = []
+
+    # ── Recording setup ───────────────────────────────────────────────────────
+    video_fps = record_fps or cfg.sim.render_fps
+    writer    = None
+    if record:
+        try:
+            writer = FFMpegWriter(fps=video_fps, codec='h264',
+                                  extra_args=['-pix_fmt', 'yuv420p'])
+            writer.setup(renderer.fig, record, dpi=cfg.renderer.dpi)
+            print(f"[main] Recording → {record}  ({video_fps} fps)")
+        except FileNotFoundError:
+            gif_path = os.path.splitext(record)[0] + '.gif'
+            print(f"[main] ffmpeg not found — falling back to GIF: {gif_path}")
+            print(f"[main] Install ffmpeg and add it to PATH for MP4 support.")
+            writer = PillowWriter(fps=video_fps)
+            writer.setup(renderer.fig, gif_path, dpi=cfg.renderer.dpi)
+            record = gif_path   # update so finish message shows correct path
 
     renderer.update_legend(show_heatmap=show_heatmap,
                            show_features=show_features,
@@ -321,261 +340,289 @@ def run(cfg: Config, preset: str | None = None, auto: bool = False) -> None:
     else:
         print("[main] Manual drive.  WASD=move  U=heatmap  M=SLAM  Q=quit.")
 
-    while plt.fignum_exists(renderer.fig.number):
-        t0 = time.perf_counter()
-        renderer.fig.canvas.flush_events()
+    try:
+        while plt.fignum_exists(renderer.fig.number):
+            t0 = time.perf_counter()
+            renderer.fig.canvas.flush_events()
 
-        if keys.quit:
-            break
+            if keys.quit:
+                break
 
-        # -- Toggles ----------------------------------------------------------
+            # -- Toggles ----------------------------------------------------------
 
-        if keys.toggle_features:
-            show_features        = not show_features
-            keys.toggle_features = False
-            renderer.update_legend(show_heatmap=show_heatmap,
-                                   show_features=show_features,
-                                   show_slam=show_slam)
-            print(f"[main] Features {'ON' if show_features else 'OFF'}")
+            if keys.toggle_features:
+                show_features        = not show_features
+                keys.toggle_features = False
+                renderer.update_legend(show_heatmap=show_heatmap,
+                                       show_features=show_features,
+                                       show_slam=show_slam)
+                print(f"[main] Features {'ON' if show_features else 'OFF'}")
 
-        if keys.toggle_slam:
-            show_slam        = not show_slam
-            keys.toggle_slam = False
-            if not show_slam:
+            if keys.toggle_slam:
+                show_slam        = not show_slam
+                keys.toggle_slam = False
+                if not show_slam:
+                    slam_artists    = _clear_artists(slam_artists)
+                    slam_feat_count = 0
+                    slam_obs_total  = 0
+                else:
+                    slam_force_draw = True
+                renderer.update_legend(show_heatmap=show_heatmap,
+                                       show_features=show_features,
+                                       show_slam=show_slam)
+                print(f"[main] SLAM map {'ON' if show_slam else 'OFF'}")
+
+            if keys.toggle_heatmap:
+                show_heatmap        = not show_heatmap
+                keys.toggle_heatmap = False
+                if not show_heatmap:
+                    heatmap.clear()
+                elif last_umap is not None:
+                    heatmap_force_draw = True
+                renderer.update_legend(show_heatmap=show_heatmap,
+                                       show_features=show_features,
+                                       show_slam=show_slam)
+                print(f"[main] Heatmap {'ON' if show_heatmap else 'OFF'}")
+
+            # -- Reset ------------------------------------------------------------
+
+            if keys.reset:
+                robot.reset(cfg.robot.start_x, cfg.robot.start_y,
+                            cfg.robot.start_theta)
+                slam_state      = SLAMState(init_pose=robot.pose,
+                                            init_pose_cov=np.zeros((3, 3)))
                 slam_artists    = _clear_artists(slam_artists)
                 slam_feat_count = 0
                 slam_obs_total  = 0
-            else:
-                slam_force_draw = True
-            renderer.update_legend(show_heatmap=show_heatmap,
-                                   show_features=show_features,
-                                   show_slam=show_slam)
-            print(f"[main] SLAM map {'ON' if show_slam else 'OFF'}")
-
-        if keys.toggle_heatmap:
-            show_heatmap        = not show_heatmap
-            keys.toggle_heatmap = False
-            if not show_heatmap:
                 heatmap.clear()
-            elif last_umap is not None:
-                heatmap_force_draw = True
-            renderer.update_legend(show_heatmap=show_heatmap,
-                                   show_features=show_features,
-                                   show_slam=show_slam)
-            print(f"[main] Heatmap {'ON' if show_heatmap else 'OFF'}")
-
-        # -- Reset ------------------------------------------------------------
-
-        if keys.reset:
-            robot.reset(cfg.robot.start_x, cfg.robot.start_y,
-                        cfg.robot.start_theta)
-            slam_state      = SLAMState(init_pose=robot.pose,
-                                        init_pose_cov=np.zeros((3, 3)))
-            slam_artists    = _clear_artists(slam_artists)
-            slam_feat_count = 0
-            slam_obs_total  = 0
-            heatmap.clear()
-            selector.reset()
-            controller.set_goal(None)
-            nav_goal_art = _clear_artists(nav_goal_art)
-            returning    = False
-            last_umap    = None
-            umap_is_fresh = False
-            mc_counter   = 0
-            keys.reset   = False
-            path_log.reset()
-            path_log.clear_overlay()
-            print("[main] Reset.")
-
-        # -- Preset switch ----------------------------------------------------
-
-        if keys.preset is not None:
-            renderer.close()
-            world, robot, sensor, extractor, renderer, slam_state, selector, controller = \
-                build_sim(cfg, keys.preset, auto=auto)
-            renderer.init()
-            renderer.fig.canvas.mpl_connect('key_press_event',   keys.on_press)
-            renderer.fig.canvas.mpl_connect('key_release_event', keys.on_release)
-            renderer.fig.canvas.mpl_connect('button_press_event', keys.on_click)
-            plt.show(block=False)
-            keys.preset        = None
-            keys._held.clear()
-            slam_artists       = []
-            slam_feat_count    = 0
-            slam_obs_total     = 0
-            slam_force_draw    = False
-            heatmap            = HeatmapRenderer(renderer.ax)
-            heatmap_force_draw = False
-            last_umap          = None
-            umap_is_fresh      = False
-            nav_goal_art       = []
-            returning          = False
-            mc_counter         = 0
-            path_log           = PathLogger(world)
-            path_log.clear_overlay()
-            show_features      = True
-            show_slam          = True
-            show_heatmap       = auto
-            renderer.update_legend(show_heatmap=auto,
-                                   show_features=True,
-                                   show_slam=True)
-            continue
-
-        # -- Path dump
-        if keys.dump_path:
-            keys.dump_path = False
-            path_log.report()
-            path_log.save('path.csv')
-            path_log.clear_overlay()
-            path_log.draw(renderer.ax)
-            renderer.fig.canvas.draw_idle()
-
-        # -- Click-to-goal ----------------------------------------------------
-        if keys.clicked_goal is not None:
-            goal = keys.clicked_goal
-            keys.clicked_goal = None
-            controller._current_pos = robot.pos.copy()
-            controller.set_goal(goal, world=_slam_world)
-            # Interrupt any autonomous return-to-start
-            returning    = False
-            nav_goal_art = _draw_goal_ring(renderer.ax, goal, nav_goal_art)
-            print(f"[click] Goal set: ({goal[0]:.1f}, {goal[1]:.1f})")
-
-        # -- Physics ----------------------------------------------------------
-
-        # Build worlds for controller use each step
-        _slam_world = SLAMWorld.from_state(slam_state)  # robot's known map
-        _cw = _CombinedWorld(world, _slam_world)        # gt+slam for proximity
-        if auto:
-            v, omega = controller.step(slam_state.pose, _cw, dt, slam_world=_slam_world)
-        else:
-            v, omega = keys.compute_command(cfg.robot.max_v, cfg.robot.max_omega)
-
-        robot.step(v, omega, dt)
-        path_log.record(robot.pos, robot.theta)
-
-        # -- EKF predict ------------------------------------------------------
-
-        predict(slam_state, v, omega, dt, cfg.ekf.Q_v, cfg.ekf.Q_w)
-
-        # -- Sense + extract --------------------------------------------------
-
-        last_scan              = sensor.scan(robot, world)
-        last_corners, last_lines = extractor.extract(robot.pose, world, last_scan)
-        all_obs                  = list(last_corners) + list(last_lines)
-
-        # -- EKF update -------------------------------------------------------
-
-        associations = associate_observations(
-            slam_state, all_obs, R_corner, R_line, cfg.ekf.gate_chi2)
-
-        for obs, feat_idx in associations:
-            R = R_corner if obs.feature_kind == 'corner' else R_line
-            if feat_idx == -1:
-                if obs.feature_kind == 'corner':
-                    init_corner(slam_state, obs.z, R, cfg.ekf.init_cov_corner)
-                else:
-                    init_line(slam_state, obs.z, R, cfg.ekf.init_cov_line,
-                              seg_p0=obs.seg_p0, seg_p1=obs.seg_p1)
-            else:
-                update_single(slam_state, feat_idx, obs.z, R)
-
-        # -- MC uncertainty map  (every ~1 s) ---------------------------------
-
-        mc_counter += 1
-        run_mc = (slam_state.n_features > 0
-                  and mc_counter >= mc_every
-                  and (auto or show_heatmap))
-        if run_mc:
-            mc_counter = 0
-            last_umap  = build_uncertainty_map(
-                state          = slam_state,
-                world          = world,
-                robot_pos      = robot.pos,
-                n_samples      = cfg.montecarlo.n_samples_local,
-                robot_radius   = cfg.robot.radius,
-                virtual_cov    = cfg.montecarlo.virtual_cov,
-                uncertainty_lo = cfg.montecarlo.uncertainty_lo,
-                uncertainty_hi = cfg.montecarlo.uncertainty_hi,
-                rng            = mc_rng,
-            )
-            umap_is_fresh = True
-            if show_heatmap:
-                heatmap.update(last_umap)
-                heatmap_force_draw = False
-
-        # -- Autonomous navigation --------------------------------------------
-
-        if auto and last_umap is not None:
-            if returning:
-                controller.set_goal(start_pos)
-                if controller.goal_reached(robot.pos):
-                    controller.set_goal(None)
-                    returning     = False
-                    umap_is_fresh = False   # force fresh MC before next goal
-                    nav_goal_art  = _clear_artists(nav_goal_art)
-                    print("[auto] Returned to start.  Exploration complete.")
-            elif controller.goal_reached(robot.pos):
-                selector.notify_goal_reached(robot.pos)
-                nav_goal_art  = _clear_artists(nav_goal_art)
+                selector.reset()
                 controller.set_goal(None)
-                umap_is_fresh = False   # wait for fresh MC before picking next goal
-
-            # Only pick a new goal when we have a fresh uncertainty map.
-            # This prevents re-querying the same stale 'complete' map every step.
-            if not returning and controller.goal is None and umap_is_fresh:
+                nav_goal_art = _clear_artists(nav_goal_art)
+                returning    = False
+                last_umap    = None
                 umap_is_fresh = False
-                result = selector.select(last_umap, robot.pos)
-                if result.source == 'complete':
-                    print("[auto] Map complete - returning to start.")
-                    returning = True
-                    controller.set_goal(start_pos, world=_slam_world)
-                else:
-                    controller.set_goal(result.goal, world=_slam_world)
-                    nav_goal_art = _draw_goal_ring(
-                        renderer.ax, result.goal, nav_goal_art)
-                    print(f"[auto] Goal ({result.source}): "
-                          f"({result.goal[0]:.1f}, {result.goal[1]:.1f})  "
-                          f"n_uncertain={result.n_uncertain}")
+                mc_counter   = 0
+                keys.reset   = False
+                path_log.reset()
+                path_log.clear_overlay()
+                print("[main] Reset.")
 
-        # -- Render at target FPS ---------------------------------------------
+            # -- Preset switch ----------------------------------------------------
 
-        now = time.perf_counter()
-        if now - last_frame >= frame_dur:
+            if keys.preset is not None:
+                # Finish the current recording before switching worlds
+                if writer is not None:
+                    writer.finish()
+                    print(f"[main] Video saved → {record}")
+                    writer = None
 
-            # SLAM overlay: only recreate artists when map has changed.
-            # Avoids creating/destroying dozens of matplotlib objects every frame.
-            if show_slam and slam_state.n_features > 0:
-                feat_count  = slam_state.n_features
-                obs_total   = sum(f.obs_count for f in slam_state.features)
-                map_changed = (feat_count != slam_feat_count
-                               or obs_total != slam_obs_total
-                               or slam_force_draw)
-                if map_changed:
-                    slam_artists    = _clear_artists(slam_artists)
-                    slam_artists    = _draw_slam(renderer.ax, slam_state)
-                    slam_feat_count = feat_count
-                    slam_obs_total  = obs_total
-                    slam_force_draw = False
-
-            # Heatmap: re-render if toggle just turned on with existing data
-            if show_heatmap and heatmap_force_draw and last_umap is not None:
-                heatmap.update(last_umap)
+                renderer.close()
+                world, robot, sensor, extractor, renderer, slam_state, selector, controller = \
+                    build_sim(cfg, keys.preset, auto=auto)
+                renderer.init()
+                renderer.fig.canvas.mpl_connect('key_press_event',   keys.on_press)
+                renderer.fig.canvas.mpl_connect('key_release_event', keys.on_release)
+                renderer.fig.canvas.mpl_connect('button_press_event', keys.on_click)
+                plt.show(block=False)
+                keys.preset        = None
+                keys._held.clear()
+                slam_artists       = []
+                slam_feat_count    = 0
+                slam_obs_total     = 0
+                slam_force_draw    = False
+                heatmap            = HeatmapRenderer(renderer.ax)
                 heatmap_force_draw = False
+                last_umap          = None
+                umap_is_fresh      = False
+                nav_goal_art       = []
+                returning          = False
+                mc_counter         = 0
+                path_log           = PathLogger(world)
+                path_log.clear_overlay()
+                show_features      = True
+                show_slam          = True
+                show_heatmap       = auto
+                renderer.update_legend(show_heatmap=auto,
+                                       show_features=True,
+                                       show_slam=True)
 
-            renderer.update(
-                robot,
-                laser_scan = last_scan,
-                corner_obs = last_corners if show_features else [],
-                line_obs   = last_lines   if show_features else [],
-            )
+                # Re-open writer on the new figure if recording was active
+                if record:
+                    try:
+                        writer = FFMpegWriter(fps=video_fps, codec='h264',
+                                              extra_args=['-pix_fmt', 'yuv420p'])
+                        writer.setup(renderer.fig, record, dpi=cfg.renderer.dpi)
+                        print(f"[main] Recording resumed → {record}")
+                    except FileNotFoundError:
+                        gif_path = os.path.splitext(record)[0] + '.gif'
+                        writer = PillowWriter(fps=video_fps)
+                        writer.setup(renderer.fig, gif_path, dpi=cfg.renderer.dpi)
+                        record = gif_path
+                        print(f"[main] Recording resumed (GIF fallback) → {record}")
 
-            plt.pause(0.001)
-            last_frame = now
+                continue
 
-        elapsed = time.perf_counter() - t0
-        if dt - elapsed > 0:
-            time.sleep(dt - elapsed)
+            # -- Path dump --------------------------------------------------------
+
+            if keys.dump_path:
+                keys.dump_path = False
+                path_log.report()
+                path_log.save('path.csv')
+                path_log.clear_overlay()
+                path_log.draw(renderer.ax)
+                renderer.fig.canvas.draw_idle()
+
+            # -- Click-to-goal ----------------------------------------------------
+
+            if keys.clicked_goal is not None:
+                goal = keys.clicked_goal
+                keys.clicked_goal = None
+                controller._current_pos = robot.pos.copy()
+                controller.set_goal(goal, world=_slam_world)
+                returning    = False
+                nav_goal_art = _draw_goal_ring(renderer.ax, goal, nav_goal_art)
+                print(f"[click] Goal set: ({goal[0]:.1f}, {goal[1]:.1f})")
+
+            # -- Physics ----------------------------------------------------------
+
+            _slam_world = SLAMWorld.from_state(slam_state)
+            _cw = _CombinedWorld(world, _slam_world)
+            if auto:
+                v, omega = controller.step(slam_state.pose, _cw, dt, slam_world=_slam_world)
+            else:
+                v, omega = keys.compute_command(cfg.robot.max_v, cfg.robot.max_omega)
+
+            robot.step(v, omega, dt)
+            path_log.record(robot.pos, robot.theta)
+
+            # -- EKF predict ------------------------------------------------------
+
+            predict(slam_state, v, omega, dt, cfg.ekf.Q_v, cfg.ekf.Q_w)
+
+            # -- Sense + extract --------------------------------------------------
+
+            last_scan                = sensor.scan(robot, world)
+            last_corners, last_lines = extractor.extract(robot.pose, world, last_scan)
+            all_obs                  = list(last_corners) + list(last_lines)
+
+            # -- EKF update -------------------------------------------------------
+
+            associations = associate_observations(
+                slam_state, all_obs, R_corner, R_line, cfg.ekf.gate_chi2)
+
+            for obs, feat_idx in associations:
+                R = R_corner if obs.feature_kind == 'corner' else R_line
+                if feat_idx == -1:
+                    if obs.feature_kind == 'corner':
+                        init_corner(slam_state, obs.z, R, cfg.ekf.init_cov_corner)
+                    else:
+                        init_line(slam_state, obs.z, R, cfg.ekf.init_cov_line,
+                                  seg_p0=obs.seg_p0, seg_p1=obs.seg_p1)
+                else:
+                    update_single(slam_state, feat_idx, obs.z, R)
+
+            # -- MC uncertainty map  (every ~1 s) ---------------------------------
+
+            mc_counter += 1
+            run_mc = (slam_state.n_features > 0
+                      and mc_counter >= mc_every
+                      and (auto or show_heatmap))
+            if run_mc:
+                mc_counter = 0
+                last_umap  = build_uncertainty_map(
+                    state          = slam_state,
+                    world          = world,
+                    robot_pos      = robot.pos,
+                    n_samples      = cfg.montecarlo.n_samples_local,
+                    robot_radius   = cfg.robot.radius,
+                    virtual_cov    = cfg.montecarlo.virtual_cov,
+                    uncertainty_lo = cfg.montecarlo.uncertainty_lo,
+                    uncertainty_hi = cfg.montecarlo.uncertainty_hi,
+                    rng            = mc_rng,
+                )
+                umap_is_fresh = True
+                if show_heatmap:
+                    heatmap.update(last_umap)
+                    heatmap_force_draw = False
+
+            # -- Autonomous navigation --------------------------------------------
+
+            if auto and last_umap is not None:
+                if returning:
+                    controller.set_goal(start_pos)
+                    if controller.goal_reached(robot.pos):
+                        controller.set_goal(None)
+                        returning     = False
+                        umap_is_fresh = False
+                        nav_goal_art  = _clear_artists(nav_goal_art)
+                        print("[auto] Returned to start.  Exploration complete.")
+                elif controller.goal_reached(robot.pos):
+                    selector.notify_goal_reached(robot.pos)
+                    nav_goal_art  = _clear_artists(nav_goal_art)
+                    controller.set_goal(None)
+                    umap_is_fresh = False
+
+                if not returning and controller.goal is None and umap_is_fresh:
+                    umap_is_fresh = False
+                    result = selector.select(last_umap, robot.pos)
+                    if result.source == 'complete':
+                        print("[auto] Map complete - returning to start.")
+                        returning = True
+                        controller.set_goal(start_pos, world=_slam_world)
+                    else:
+                        controller.set_goal(result.goal, world=_slam_world)
+                        nav_goal_art = _draw_goal_ring(
+                            renderer.ax, result.goal, nav_goal_art)
+                        print(f"[auto] Goal ({result.source}): "
+                              f"({result.goal[0]:.1f}, {result.goal[1]:.1f})  "
+                              f"n_uncertain={result.n_uncertain}")
+
+            # -- Render at target FPS ---------------------------------------------
+
+            now = time.perf_counter()
+            if now - last_frame >= frame_dur:
+
+                if show_slam and slam_state.n_features > 0:
+                    feat_count  = slam_state.n_features
+                    obs_total   = sum(f.obs_count for f in slam_state.features)
+                    map_changed = (feat_count != slam_feat_count
+                                   or obs_total != slam_obs_total
+                                   or slam_force_draw)
+                    if map_changed:
+                        slam_artists    = _clear_artists(slam_artists)
+                        slam_artists    = _draw_slam(renderer.ax, slam_state)
+                        slam_feat_count = feat_count
+                        slam_obs_total  = obs_total
+                        slam_force_draw = False
+
+                if show_heatmap and heatmap_force_draw and last_umap is not None:
+                    heatmap.update(last_umap)
+                    heatmap_force_draw = False
+
+                renderer.update(
+                    robot,
+                    laser_scan = last_scan,
+                    corner_obs = last_corners if show_features else [],
+                    line_obs   = last_lines   if show_features else [],
+                )
+
+                plt.pause(0.001)
+
+                # ── Capture frame for recording ───────────────────────────────
+                if writer is not None:
+                    writer.grab_frame()
+
+                last_frame = now
+
+            elapsed = time.perf_counter() - t0
+            if dt - elapsed > 0:
+                time.sleep(dt - elapsed)
+
+    finally:
+        # Always finalize the video so the file isn't left incomplete
+        if writer is not None:
+            writer.finish()
+            print(f"[main] Video saved → {record}")
 
     path_log.report()
     renderer.close()
@@ -592,10 +639,18 @@ def parse_args():
     p.add_argument('--config', default='config.yaml')
     p.add_argument('--auto',   action='store_true',
                    help='Enable autonomous exploration (Phase 6)')
+    p.add_argument('--record', metavar='FILE', nargs='?',
+                   const='recording.mp4', default=None,
+                   help='Record rendered frames to an MP4 file '
+                        '(default filename: recording.mp4)')
+    p.add_argument('--record-fps', type=int, default=None,
+                   help='Frame-rate for the recorded video '
+                        '(default: same as render_fps in config)')
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = parse_args()
     cfg  = Config.load(args.config)
-    run(cfg, preset=args.world, auto=args.auto)
+    run(cfg, preset=args.world, auto=args.auto,
+        record=args.record, record_fps=args.record_fps)
