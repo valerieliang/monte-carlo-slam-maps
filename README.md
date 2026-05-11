@@ -137,7 +137,7 @@ x̂_v(t+dt) = f(x̂_v(t), v, ω, dt)   [unicycle kinematics, Section 2.1]
 **Covariance propagation** uses the **Jacobian** of the motion model linearised at the current estimate:
 
 ```
-F_v = ∂f/∂x_v = | 1  0  -v·sin(θ)·dt |
+F_v = ∂f/∂x_v = | 1  0  -v·sin(θ)·dt   |
                  | 0  1   v·cos(θ)·dt  |
                  | 0  0   1            |
 ```
@@ -301,7 +301,7 @@ Scores are normalised to `[0, 1]`. The "uncertain band" `[uncertainty_lo, uncert
 | File | Purpose |
 |------|---------|
 | `env/robot.py` | Robot state `(x, y, θ)`, unicycle kinematics (`step()`), pose history trail. The single source of truth for ground-truth robot position. |
-| `env/sensor.py` | 2-D laser scanner simulation. Casts rays via `World.ray_intersect()`, adds Gaussian noise to range and bearing. Also provides noiseless `expected_corner()` and `expected_line()` functions used by the EKF update. |
+| `env/sensor.py`| 2-D laser scanner simulation. Casts rays via `World.ray_intersect()`, adds Gaussian noise to range and bearing. Also provides noiseless `expected_corner()` and `expected_line()` functions used by the EKF update. |
 | `env/world.py` | Ground-truth environment geometry. Holds `Segment` (wall) and `Corner` objects. Provides `ray_intersect()` for both the sensor and the controller. Contains three preset environments: `lab`, `corridor`, `open`. The robot never has direct access to this data — it only receives sensor observations derived from it. |
 
 ### SLAM — `slam/`
@@ -358,25 +358,25 @@ The `run()` function in `main.py` implements a fixed-rate control loop at `dt = 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  1. CONTROLLER STEP                                          │
+│  1. CONTROLLER STEP                                         │
 │     Auto:   controller.step(slam_pose, combined_world, dt)  │
-│     Manual: keyboard WASD → (v, ω)                         │
+│     Manual: keyboard WASD → (v, ω)                          │
 │                                                             │
 │  2. PHYSICS                                                 │
-│     robot.step(v, ω, dt)     ← ground-truth motion         │
-│     path_log.record(...)     ← trajectory logging          │
+│     robot.step(v, ω, dt)     ← ground-truth motion          │
+│     path_log.record(...)     ← trajectory logging           │
 │                                                             │
 │  3. EKF PREDICT                                             │
-│     predict(slam_state, v, ω, dt, Q_v, Q_w)               │
-│     Updates x̂_v and P using linearised unicycle Jacobian   │
+│     predict(slam_state, v, ω, dt, Q_v, Q_w)                 │
+│     Updates x̂_v and P using linearised unicycle Jacobian    │
 │                                                             │
 │  4. SENSE + EXTRACT                                         │
 │     scan   = sensor.scan(robot, world)                      │
 │     corners, lines = extractor.extract(robot.pose, scan)    │
 │                                                             │
 │  5. DATA ASSOCIATION + EKF UPDATE                           │
-│     For each observation:                                    │
-│       if matched → update_single(state, feat_idx, z, R)    │
+│     For each observation:                                   │
+│       if matched → update_single(state, feat_idx, z, R)     │
 │       if new     → init_corner / init_line                  │
 │                                                             │
 │  6. MC UNCERTAINTY MAP  (every ~1 simulated second)         │
@@ -488,46 +488,6 @@ navigation:
 ```
 
 If the robot oscillates around goals, reduce `k_w`. If it's slow to reach goals, increase `k_v` (but don't exceed `max_v` in effect).
-
-### Suggested Experiment Configurations
-
-**Experiment A — Stress-test feature uncertainty:**
-```yaml
-sensor:
-  noise_range: 0.15
-  noise_bearing: 0.05
-ekf:
-  init_cov_corner: 1.5
-```
-Expect large covariance ellipses that shrink as features are re-observed.
-
-**Experiment B — Limited sensor range (force active exploration):**
-```yaml
-sensor:
-  max_range: 4.0
-montecarlo:
-  n_samples_local: 300
-```
-The robot will need to approach walls closely and turn to cover the whole map.
-
-**Experiment C — Narrow corridor navigation:**
-```yaml
-world:
-  preset: corridor
-robot:
-  max_v: 0.6
-navigation:
-  controller_k_w: 1.8
-```
-Tests wall-following and the branch detection in a confined space.
-
-**Experiment D — Noisy motion (simulate wheel slip):**
-```yaml
-ekf:
-  Q_v: 0.15
-  Q_w: 0.20
-```
-Vehicle pose covariance grows faster between observations. Watch whether loop-closure (revisiting known features) corrects drift.
 
 ---
 
